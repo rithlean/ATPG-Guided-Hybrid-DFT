@@ -50,6 +50,6 @@ The node selection logic utilizes a **Greedy Intersection Heuristic**:
 4.  **Select:** Inserts Inversion Logic (XOR) at the nodes with the highest intersection score.
 
 ## Author
-[Your Name]
+Muhammad Harith bin Hairuddin
 Master's Thesis Research
-[University Name]
+UTM
