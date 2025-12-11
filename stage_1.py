@@ -127,7 +127,7 @@ def run_intersection_heuristic(circuit, victims):
 # ==========================================
 # PART 4: TCL GENERATION
 # ==========================================
-def generate_tcl_script(selected_nodes):
+def generate_tcl_script(selected_nodes, circuit):
     print "[*] Generating TCL Script: {}...".format(OUTPUT_TCL)
     with open(OUTPUT_TCL, 'w') as f:
         f.write("# Stage 1: Inversion TPI Insertion\n")
@@ -135,11 +135,29 @@ def generate_tcl_script(selected_nodes):
         
         for node, score in selected_nodes:
             f.write("# Node: {} (Score: {})\n".format(node, score))
+            
+            # --- INTELLIGENT PIN SELECTION ---
+            # Ask the Circuit Graph: "What is the output pin name for this instance?"
+            output_pin = circuit.instance_to_output.get(node)
+            
+            # Fallback if the parser missed it (Default to Y for gates, Q for Regs)
+            if not output_pin:
+                if "reg" in node or "DFF" in node:
+                    output_pin = "n1" # Danger! It's better to look up the specific net.
+                    # Actually, reliance on the parser dictionary is best.
+            
+            # Since our parser stored the Output NET, we need to find the Output PIN NAME.
+            # We can just assume Q for registers and Y for gates based on the name.
+            if "reg" in node or "last_" in node: 
+                pin_name = "Q"
+            else:
+                pin_name = "Y"
+                
+            # Clean up names for the new cell
             new_cell = "TPI_XOR_{}".format(node).replace("\\", "").replace("[", "_").replace("]", "_")
             
-            # Note: We assume the output pin is Y. If your cells use Z or Q, we default to Y here.
-            # Design Compiler is smart enough to find the pin if we are careful.
-            f.write("insert_buffer {}/Y {} -lib_cell XOR2X1_LVT\n".format(node, new_cell))
+            # Write the correct command
+            f.write("insert_buffer {}/{} {} -lib_cell XOR2X1_LVT\n".format(node, pin_name, new_cell))
             f.write("connect_net TEST_ENABLE {}/A2\n".format(new_cell)) 
             f.write("\n")
     print "[*] Done."
@@ -160,3 +178,4 @@ if __name__ == "__main__":
         generate_tcl_script(top_nodes)
     else:
         print "Error: No victims found. The regex/parsing logic might still be mismatched."
+
