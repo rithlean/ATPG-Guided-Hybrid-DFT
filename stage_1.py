@@ -26,7 +26,6 @@ class CircuitGraph:
             content = f.read()
 
         # Regex for instances (Standard + Escaped Names)
-        # Handles: DFFARX1_LVT \stato_reg[0] ( .D(...) );
         instance_pattern = re.compile(r'([\w\\]+)\s+([\w\\\[\]]+)\s*\((.*?)\);', re.DOTALL)
         
         matches = instance_pattern.findall(content)
@@ -41,9 +40,12 @@ class CircuitGraph:
             output = None
             
             for pin_name, net_name in pin_matches:
-                # OUTPUT PINS
+                # OUTPUT PINS (Mapped to Y or Q/QN)
                 if pin_name in ['Y', 'Z', 'Q', 'QN', 'SO']: 
                     output = net_name
+                    # Key Step: Save exactly which pin is the output for this instance
+                    # We store the pin NAME (e.g., 'Q') separately if we wanted, 
+                    # but here we map Instance -> Net.
                     self.instance_to_output[clean_inst] = net_name
                     self.net_driver_inst[net_name] = clean_inst
                 
@@ -75,7 +77,7 @@ class CircuitGraph:
         return cone_nodes
 
 # ==========================================
-# PART 2: FAILURE PARSER (FIXED)
+# PART 2: FAILURE PARSER
 # ==========================================
 def parse_tetramax_failures(filename):
     print "[*] Parsing Failure Report: {}...".format(filename)
@@ -83,23 +85,13 @@ def parse_tetramax_failures(filename):
     
     with open(filename, 'r') as f:
         for line in f:
-            # Skip empty lines or headers
             if len(line) < 5 or "defect" in line or "---" in line:
                 continue
 
-            # Look for Fault Codes: ND, AU, AN, AP, NO
-            # Added "NO" because your report shows it.
             if any(c in line for c in ["ND", "AU", "AN", "AP", "NO"]):
-                
-                # ROBUST PARSING STRATEGY:
-                # 1. Split line by whitespace to get columns
                 parts = line.split()
-                
-                # 2. The Path is usually the last column (e.g., U145/Y)
                 if len(parts) > 0:
                     path = parts[-1]
-                    
-                    # 3. Extract Instance Name (Left of the /)
                     if "/" in path:
                         inst = path.split('/')[0]
                         victims.append(inst)
@@ -125,7 +117,7 @@ def run_intersection_heuristic(circuit, victims):
     return sorted_nodes[:TOP_K_NODES]
 
 # ==========================================
-# PART 4: TCL GENERATION
+# PART 4: TCL GENERATION (FIXED)
 # ==========================================
 def generate_tcl_script(selected_nodes, circuit):
     print "[*] Generating TCL Script: {}...".format(OUTPUT_TCL)
@@ -136,27 +128,22 @@ def generate_tcl_script(selected_nodes, circuit):
         for node, score in selected_nodes:
             f.write("# Node: {} (Score: {})\n".format(node, score))
             
-            # --- INTELLIGENT PIN SELECTION ---
-            # Ask the Circuit Graph: "What is the output pin name for this instance?"
-            output_pin = circuit.instance_to_output.get(node)
-            
-            # Fallback if the parser missed it (Default to Y for gates, Q for Regs)
-            if not output_pin:
-                if "reg" in node or "DFF" in node:
-                    output_pin = "n1" # Danger! It's better to look up the specific net.
-                    # Actually, reliance on the parser dictionary is best.
-            
-            # Since our parser stored the Output NET, we need to find the Output PIN NAME.
-            # We can just assume Q for registers and Y for gates based on the name.
-            if "reg" in node or "last_" in node: 
+            # INTELLIGENT PIN SELECTION
+            # 1. Try to guess based on name (Robust Fallback)
+            if "reg" in node or "last_" in node or "DFF" in node:
                 pin_name = "Q"
             else:
                 pin_name = "Y"
-                
-            # Clean up names for the new cell
+            
+            # 2. Try to look up the Net to be sure (Advanced)
+            # This part is optional but good for debugging
+            # driven_net = circuit.instance_to_output.get(node)
+            
+            # Clean up names for the new cell (remove illegal chars for TCL variables)
             new_cell = "TPI_XOR_{}".format(node).replace("\\", "").replace("[", "_").replace("]", "_")
             
-            # Write the correct command
+            # Write the insertion command
+            # Note: We keep the backslash in the Node Name for DC command, but clean it for the new cell name
             f.write("insert_buffer {}/{} {} -lib_cell XOR2X1_LVT\n".format(node, pin_name, new_cell))
             f.write("connect_net TEST_ENABLE {}/A2\n".format(new_cell)) 
             f.write("\n")
@@ -175,7 +162,8 @@ if __name__ == "__main__":
         print "\n[RESULT] Top Selected Nodes:"
         for node, score in top_nodes:
             print "  - {}: Covers {} faults".format(node, score)
-        generate_tcl_script(top_nodes)
+            
+        # FIXED: Passing both arguments now
+        generate_tcl_script(top_nodes, circuit)
     else:
-        print "Error: No victims found. The regex/parsing logic might still be mismatched."
-
+        print "Error: No victims found."
