@@ -48,6 +48,25 @@ class CircuitGraph:
                 self.drivers[output] = inputs
         print "    - Parsed {} instances.".format(len(matches))
 
+    # --- THIS WAS MISSING IN THE PREVIOUS PASTE ---
+    def get_fanin_cone(self, start_inst, depth):
+        cone_nodes = set()
+        start_net = self.instance_to_output.get(start_inst)
+        if not start_net: return cone_nodes
+
+        def trace(current_net, current_depth):
+            if current_depth == 0: return
+            driver_nets = self.drivers.get(current_net, [])
+            for d_net in driver_nets:
+                driver_inst = self.net_driver_inst.get(d_net)
+                if driver_inst:
+                    cone_nodes.add(driver_inst)
+                    trace(d_net, current_depth - 1)
+
+        trace(start_net, depth)
+        return cone_nodes
+    # -----------------------------------------------
+
 # ==========================================
 # PART 2: FAILURE PARSER
 # ==========================================
@@ -67,7 +86,7 @@ def parse_tetramax_failures(filename):
     return list(set(victims))
 
 # ==========================================
-# PART 3: INTERSECTION HEURISTIC (With U115 Filter)
+# PART 3: INTERSECTION HEURISTIC
 # ==========================================
 def run_intersection_heuristic(circuit, victims):
     print "[*] Running Structural Cone Analysis..."
@@ -75,7 +94,7 @@ def run_intersection_heuristic(circuit, victims):
     for victim in victims:
         cone = circuit.get_fanin_cone(victim, TRACE_DEPTH)
         for node in cone:
-            # FILTER: Skip Global Reset Driver to avoid X-propagation issues
+            # FILTER: Skip Global Reset Driver (U115)
             if node == "U115": continue 
             node_scores[node] += 1
         if victim != "U115": node_scores[victim] += 1 
@@ -84,7 +103,7 @@ def run_intersection_heuristic(circuit, victims):
     return sorted_nodes[:TOP_K_NODES]
 
 # ==========================================
-# PART 4: TCL GENERATION (FINAL ROBUST VERSION)
+# PART 4: TCL GENERATION
 # ==========================================
 def generate_tcl_script(selected_nodes, circuit):
     print "[*] Generating TCL Script: {}...".format(OUTPUT_TCL)
@@ -98,7 +117,7 @@ def generate_tcl_script(selected_nodes, circuit):
         f.write("if {$lib_cell_ref == \"\"} { echo \"Error: XOR2X1_LVT not found in library!\"; exit }\n")
         f.write("echo \"Using Library Cell: $lib_cell_ref\"\n\n")
         
-        # 2. SETUP: Create Port AND Net (Fixes the 'Can't find net' error)
+        # 2. SETUP: Create Port AND Net
         f.write("create_port -direction in TEST_ENABLE\n")
         f.write("create_net TEST_ENABLE\n")
         f.write("connect_net TEST_ENABLE TEST_ENABLE\n\n")
@@ -120,25 +139,13 @@ def generate_tcl_script(selected_nodes, circuit):
             new_net_name  = "n_tpi_{}".format(clean_name)
 
             # --- ECO COMMANDS ---
-            # 1. Capture existing net
             f.write("set target_net [get_nets -of_objects [get_pins {}]]\n".format(full_pin_path))
-            
-            # 2. Create the XOR Cell (Using Braces {} and the Reference Variable)
-            # This fixes the CMD-036 error
             f.write("create_cell {{{}}} $lib_cell_ref\n".format(xor_inst_name))
-            
-            # 3. Disconnect original wire
             f.write("disconnect_net $target_net {}\n".format(full_pin_path))
-            
-            # 4. Connect original wire to XOR Output
             f.write("connect_net $target_net {}/Y\n".format(xor_inst_name))
-            
-            # 5. Bridge Driver -> XOR Input
             f.write("create_net {}\n".format(new_net_name))
             f.write("connect_net {} {}\n".format(new_net_name, full_pin_path))
             f.write("connect_net {} {}/A1\n".format(new_net_name, xor_inst_name))
-            
-            # 6. Connect Control
             f.write("connect_net TEST_ENABLE {}/A2\n".format(xor_inst_name))
             f.write("\n")
             
