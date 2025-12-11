@@ -21,12 +21,11 @@ class CircuitGraph:
         self.net_driver_inst = {}
 
     def parse_verilog(self, filename):
-        print(f"[*] Parsing Netlist: {filename}...")
+        print "[*] Parsing Netlist: {}...".format(filename)
         with open(filename, 'r') as f:
             content = f.read()
 
         # Regex to find instances. 
-        # Handles names like "U50" and escaped names like "\stato_reg[0]"
         # Pattern: CellName  InstanceName  ( Pins );
         instance_pattern = re.compile(r'([\w\\]+)\s+([\w\\\[\]]+)\s*\((.*?)\);', re.DOTALL)
         
@@ -50,7 +49,6 @@ class CircuitGraph:
                     self.net_driver_inst[net_name] = clean_inst
                 
                 # INPUT PINS (Expanded for your library)
-                # Includes A, B, A1, A2, S0, D, CLK, RSTB, etc.
                 elif pin_name in ['A', 'B', 'C', 'D', 'A1', 'A2', 'A3', 'A4', 
                                   'B1', 'B2', 'S0', 'S1', 'CLK', 'RSTB', 'SI', 'SE']:
                     inputs.append(net_name)
@@ -58,7 +56,7 @@ class CircuitGraph:
             if output:
                 self.drivers[output] = inputs
 
-        print(f"    - Parsed {len(matches)} instances.")
+        print "    - Parsed {} instances.".format(len(matches))
 
     def get_fanin_cone(self, start_inst, depth):
         cone_nodes = set()
@@ -81,27 +79,28 @@ class CircuitGraph:
 # PART 2: FAILURE PARSER
 # ==========================================
 def parse_tetramax_failures(filename):
-    print(f"[*] Parsing Failure Report: {filename}...")
+    print "[*] Parsing Failure Report: {}...".format(filename)
     victims = []
     
     with open(filename, 'r') as f:
         for line in f:
             # We look for ND, AU, AN, AP codes
-            if any(code in line for code in ["ND", "AU", "AN", "AP"]):
+            # In Python 2.7, map/any logic is safer with loops or list comps
+            if "ND" in line or "AU" in line or "AN" in line or "AP" in line:
                 # Regex to extract instance from path like /U145/Y or /\stato_reg[0]/RSTB
                 match = re.search(r'/([\w\\\[\]]+)/', line)
                 if match:
                     victims.append(match.group(1))
     
     victims = list(set(victims))
-    print(f"    - Found {len(victims)} unique RPR victim nodes.")
+    print "    - Found {} unique RPR victim nodes.".format(len(victims))
     return victims
 
 # ==========================================
 # PART 3: INTERSECTION HEURISTIC
 # ==========================================
 def run_intersection_heuristic(circuit, victims):
-    print("[*] Running Structural Cone Analysis...")
+    print "[*] Running Structural Cone Analysis..."
     node_scores = defaultdict(int)
     
     for victim in victims:
@@ -121,20 +120,20 @@ def run_intersection_heuristic(circuit, victims):
 # PART 4: TCL GENERATION
 # ==========================================
 def generate_tcl_script(selected_nodes):
-    print(f"[*] Generating TCL Script: {OUTPUT_TCL}...")
+    print "[*] Generating TCL Script: {}...".format(OUTPUT_TCL)
     with open(OUTPUT_TCL, 'w') as f:
         f.write("# Stage 1: Inversion TPI Insertion\n")
         f.write("create_port -direction in TEST_ENABLE\n\n")
         
         for node, score in selected_nodes:
-            f.write(f"# Node: {node} (Score: {score})\n")
+            f.write("# Node: {} (Score: {})\n".format(node, score))
             # We insert an XOR on the 'Y' pin (Output)
             # Use specific library cell name (XOR2X1_LVT)
-            new_cell = f"TPI_XOR_{node}".replace("\\", "").replace("[", "_").replace("]", "_")
-            f.write(f"insert_buffer {node}/Y {new_cell} -lib_cell XOR2X1_LVT\n")
-            f.write(f"connect_net TEST_ENABLE {new_cell}/A2\n") # Assuming A2 is one input
+            new_cell = "TPI_XOR_{}".format(node).replace("\\", "").replace("[", "_").replace("]", "_")
+            f.write("insert_buffer {}/Y {} -lib_cell XOR2X1_LVT\n".format(node, new_cell))
+            f.write("connect_net TEST_ENABLE {}/A2\n".format(new_cell)) # Assuming A2 is one input
             f.write("\n")
-    print("[*] Done.")
+    print "[*] Done."
 
 # ==========================================
 # MAIN
@@ -146,9 +145,9 @@ if __name__ == "__main__":
     victims = parse_tetramax_failures(REPORT_FILE)
     if victims:
         top_nodes = run_intersection_heuristic(circuit, victims)
-        print("\n[RESULT] Top Selected Nodes:")
+        print "\n[RESULT] Top Selected Nodes:"
         for node, score in top_nodes:
-            print(f"  - {node}: Covers {score} faults")
+            print "  - {}: Covers {} faults".format(node, score)
         generate_tcl_script(top_nodes)
     else:
-        print("No victims found. Check regex.")
+        print "No victims found. Check regex."
