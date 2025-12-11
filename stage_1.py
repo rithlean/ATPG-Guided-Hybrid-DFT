@@ -48,7 +48,7 @@ class CircuitGraph:
                 self.drivers[output] = inputs
         print "    - Parsed {} instances.".format(len(matches))
 
-    # --- THIS WAS MISSING IN THE PREVIOUS PASTE ---
+    # CRITICAL: This function must be indented inside the class
     def get_fanin_cone(self, start_inst, depth):
         cone_nodes = set()
         start_net = self.instance_to_output.get(start_inst)
@@ -65,7 +65,6 @@ class CircuitGraph:
 
         trace(start_net, depth)
         return cone_nodes
-    # -----------------------------------------------
 
 # ==========================================
 # PART 2: FAILURE PARSER
@@ -86,7 +85,7 @@ def parse_tetramax_failures(filename):
     return list(set(victims))
 
 # ==========================================
-# PART 3: INTERSECTION HEURISTIC
+# PART 3: INTERSECTION HEURISTIC (Filters U115)
 # ==========================================
 def run_intersection_heuristic(circuit, victims):
     print "[*] Running Structural Cone Analysis..."
@@ -94,7 +93,7 @@ def run_intersection_heuristic(circuit, victims):
     for victim in victims:
         cone = circuit.get_fanin_cone(victim, TRACE_DEPTH)
         for node in cone:
-            # FILTER: Skip Global Reset Driver (U115)
+            # FILTER: Skip Global Reset Driver
             if node == "U115": continue 
             node_scores[node] += 1
         if victim != "U115": node_scores[victim] += 1 
@@ -103,7 +102,7 @@ def run_intersection_heuristic(circuit, victims):
     return sorted_nodes[:TOP_K_NODES]
 
 # ==========================================
-# PART 4: TCL GENERATION
+# PART 4: TCL GENERATION (ROBUST)
 # ==========================================
 def generate_tcl_script(selected_nodes, circuit):
     print "[*] Generating TCL Script: {}...".format(OUTPUT_TCL)
@@ -111,13 +110,10 @@ def generate_tcl_script(selected_nodes, circuit):
         f.write("# Stage 1: Inversion TPI Insertion (ECO Surgery Mode)\n")
         f.write("# Robust Syntax: Uses braces and dynamic lib_cell lookup\n\n")
         
-        # 1. SETUP: Find the exact library cell name once
-        f.write("# Find the XOR cell in the loaded library to avoid ambiguity\n")
         f.write("set lib_cell_ref [get_object_name [get_lib_cells */XOR2X1_LVT]]\n")
         f.write("if {$lib_cell_ref == \"\"} { echo \"Error: XOR2X1_LVT not found in library!\"; exit }\n")
         f.write("echo \"Using Library Cell: $lib_cell_ref\"\n\n")
         
-        # 2. SETUP: Create Port AND Net
         f.write("create_port -direction in TEST_ENABLE\n")
         f.write("create_net TEST_ENABLE\n")
         f.write("connect_net TEST_ENABLE TEST_ENABLE\n\n")
@@ -126,19 +122,16 @@ def generate_tcl_script(selected_nodes, circuit):
             f.write("# --------------------------------------------------------\n")
             f.write("# Target Node: {} (Score: {})\n".format(node, score))
             
-            # Determine Pin Name
             if "reg" in node or "last_" in node or "DFF" in node:
                 pin_name = "Q"
             else:
                 pin_name = "Y"
                 
-            # Construct Safe Names
             full_pin_path = "{" + "{}/{}".format(node, pin_name) + "}"
             clean_name = node.replace("\\", "").replace("[", "_").replace("]", "_")
             xor_inst_name = "TPI_XOR_{}".format(clean_name)
             new_net_name  = "n_tpi_{}".format(clean_name)
 
-            # --- ECO COMMANDS ---
             f.write("set target_net [get_nets -of_objects [get_pins {}]]\n".format(full_pin_path))
             f.write("create_cell {{{}}} $lib_cell_ref\n".format(xor_inst_name))
             f.write("disconnect_net $target_net {}\n".format(full_pin_path))
