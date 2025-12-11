@@ -5,11 +5,11 @@ from collections import defaultdict
 # ==========================================
 # CONFIGURATION
 # ==========================================
-NETLIST_FILE = "b10.v"            # Your Netlist
-REPORT_FILE  = "stage1_failures.rpt" # Your Fault Report
+NETLIST_FILE = "b10.v"            
+REPORT_FILE  = "stage1_failures.rpt" 
 OUTPUT_TCL   = "insert_tpi_logic.tcl"
-TOP_K_NODES  = 5                     # How many TPs to insert
-TRACE_DEPTH  = 3                     # How far back to trace
+TOP_K_NODES  = 5                     
+TRACE_DEPTH  = 3                     
 
 # ==========================================
 # PART 1: NETLIST PARSER
@@ -25,16 +25,15 @@ class CircuitGraph:
         with open(filename, 'r') as f:
             content = f.read()
 
-        # Regex to find instances. 
-        # Pattern: CellName  InstanceName  ( Pins );
+        # Regex for instances (Standard + Escaped Names)
+        # Handles: DFFARX1_LVT \stato_reg[0] ( .D(...) );
         instance_pattern = re.compile(r'([\w\\]+)\s+([\w\\\[\]]+)\s*\((.*?)\);', re.DOTALL)
         
         matches = instance_pattern.findall(content)
         for cell_type, inst_name, pins in matches:
-            # Clean up escaped names (remove leading backslash if present)
             clean_inst = inst_name.strip()
             
-            # Parse Pins: .PinName(NetName)
+            # Parse Pins
             pin_pattern = re.compile(r'\.([\w\[\]]+)\s*\(\s*([\w\\\[\]]+)\s*\)')
             pin_matches = pin_pattern.findall(pins)
             
@@ -42,13 +41,13 @@ class CircuitGraph:
             output = None
             
             for pin_name, net_name in pin_matches:
-                # OUTPUT PINS (Based on SAED32 & your netlist)
+                # OUTPUT PINS
                 if pin_name in ['Y', 'Z', 'Q', 'QN', 'SO']: 
                     output = net_name
                     self.instance_to_output[clean_inst] = net_name
                     self.net_driver_inst[net_name] = clean_inst
                 
-                # INPUT PINS (Expanded for your library)
+                # INPUT PINS
                 elif pin_name in ['A', 'B', 'C', 'D', 'A1', 'A2', 'A3', 'A4', 
                                   'B1', 'B2', 'S0', 'S1', 'CLK', 'RSTB', 'SI', 'SE']:
                     inputs.append(net_name)
@@ -76,7 +75,7 @@ class CircuitGraph:
         return cone_nodes
 
 # ==========================================
-# PART 2: FAILURE PARSER
+# PART 2: FAILURE PARSER (FIXED)
 # ==========================================
 def parse_tetramax_failures(filename):
     print "[*] Parsing Failure Report: {}...".format(filename)
@@ -84,14 +83,27 @@ def parse_tetramax_failures(filename):
     
     with open(filename, 'r') as f:
         for line in f:
-            # We look for ND, AU, AN, AP codes
-            # In Python 2.7, map/any logic is safer with loops or list comps
-            if "ND" in line or "AU" in line or "AN" in line or "AP" in line:
-                # Regex to extract instance from path like /U145/Y or /\stato_reg[0]/RSTB
-                match = re.search(r'/([\w\\\[\]]+)/', line)
-                if match:
-                    victims.append(match.group(1))
-    
+            # Skip empty lines or headers
+            if len(line) < 5 or "defect" in line or "---" in line:
+                continue
+
+            # Look for Fault Codes: ND, AU, AN, AP, NO
+            # Added "NO" because your report shows it.
+            if any(c in line for c in ["ND", "AU", "AN", "AP", "NO"]):
+                
+                # ROBUST PARSING STRATEGY:
+                # 1. Split line by whitespace to get columns
+                parts = line.split()
+                
+                # 2. The Path is usually the last column (e.g., U145/Y)
+                if len(parts) > 0:
+                    path = parts[-1]
+                    
+                    # 3. Extract Instance Name (Left of the /)
+                    if "/" in path:
+                        inst = path.split('/')[0]
+                        victims.append(inst)
+
     victims = list(set(victims))
     print "    - Found {} unique RPR victim nodes.".format(len(victims))
     return victims
@@ -104,15 +116,11 @@ def run_intersection_heuristic(circuit, victims):
     node_scores = defaultdict(int)
     
     for victim in victims:
-        # Trace backward from the victim
         cone = circuit.get_fanin_cone(victim, TRACE_DEPTH)
-        
-        # Intersection Scoring
         for node in cone:
             node_scores[node] += 1
-        node_scores[victim] += 1 # The node itself counts
+        node_scores[victim] += 1 
 
-    # Sort Descending
     sorted_nodes = sorted(node_scores.items(), key=lambda x: x[1], reverse=True)
     return sorted_nodes[:TOP_K_NODES]
 
@@ -127,11 +135,12 @@ def generate_tcl_script(selected_nodes):
         
         for node, score in selected_nodes:
             f.write("# Node: {} (Score: {})\n".format(node, score))
-            # We insert an XOR on the 'Y' pin (Output)
-            # Use specific library cell name (XOR2X1_LVT)
             new_cell = "TPI_XOR_{}".format(node).replace("\\", "").replace("[", "_").replace("]", "_")
+            
+            # Note: We assume the output pin is Y. If your cells use Z or Q, we default to Y here.
+            # Design Compiler is smart enough to find the pin if we are careful.
             f.write("insert_buffer {}/Y {} -lib_cell XOR2X1_LVT\n".format(node, new_cell))
-            f.write("connect_net TEST_ENABLE {}/A2\n".format(new_cell)) # Assuming A2 is one input
+            f.write("connect_net TEST_ENABLE {}/A2\n".format(new_cell)) 
             f.write("\n")
     print "[*] Done."
 
@@ -150,4 +159,4 @@ if __name__ == "__main__":
             print "  - {}: Covers {} faults".format(node, score)
         generate_tcl_script(top_nodes)
     else:
-        print "No victims found. Check regex."
+        print "Error: No victims found. The regex/parsing logic might still be mismatched."
