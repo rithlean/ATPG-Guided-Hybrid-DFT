@@ -92,14 +92,26 @@ def parse_tetramax_failures(filename):
 # ==========================================
 # PART 3: INTERSECTION HEURISTIC (Standard)
 # ==========================================
+# In stage_1.py, update this function:
+
 def run_intersection_heuristic(circuit, victims):
     print "[*] Running Structural Cone Analysis..."
     node_scores = defaultdict(int)
+    
     for victim in victims:
         cone = circuit.get_fanin_cone(victim, TRACE_DEPTH)
         for node in cone:
+            # --- FILTER ADDED HERE ---
+            # If the node is U115 (Reset Driver), SKIP IT.
+            # We skip it because messing with Global Reset is dangerous.
+            if node == "U115": 
+                continue 
+            
             node_scores[node] += 1
-        node_scores[victim] += 1 
+        
+        # Don't count the victim itself if it is U115
+        if victim != "U115":
+            node_scores[victim] += 1 
 
     sorted_nodes = sorted(node_scores.items(), key=lambda x: x[1], reverse=True)
     return sorted_nodes[:TOP_K_NODES]
@@ -111,62 +123,50 @@ def generate_tcl_script(selected_nodes, circuit):
     print "[*] Generating TCL Script: {}...".format(OUTPUT_TCL)
     with open(OUTPUT_TCL, 'w') as f:
         f.write("# Stage 1: Inversion TPI Insertion (ECO Surgery Mode)\n")
-        f.write("# Robust Syntax: Uses braces and dynamic lib_cell lookup\n\n")
-        
-        # 1. SETUP: Find the exact library cell name once
-        f.write("# Find the XOR cell in the loaded library to avoid ambiguity\n")
-        f.write("set lib_cell_ref [get_object_name [get_lib_cells */XOR2X1_LVT]]\n")
-        f.write("if {$lib_cell_ref == \"\"} { echo \"Error: XOR2X1_LVT not found in library!\"; exit }\n")
-        f.write("echo \"Using Library Cell: $lib_cell_ref\"\n\n")
-        
-        # --- FIX STARTS HERE ---
-        f.write("# Create the Port AND the Internal Net\n")
-        f.write("create_port -direction in TEST_ENABLE\n")
-        f.write("create_net TEST_ENABLE\n")
-        f.write("connect_net TEST_ENABLE TEST_ENABLE\n\n")
-        # --- FIX ENDS HERE ---
+        f.write("# This script manually splices XOR gates into the netlist.\n")
+        f.write("create_port -direction in TEST_ENABLE\n\n")
         
         for node, score in selected_nodes:
             f.write("# --------------------------------------------------------\n")
             f.write("# Target Node: {} (Score: {})\n".format(node, score))
             
-            # Determine Pin Name
+            # 1. Determine Pin Name (Q for regs, Y for gates)
             if "reg" in node or "last_" in node or "DFF" in node:
                 pin_name = "Q"
             else:
                 pin_name = "Y"
                 
-            # Construct Safe Names
-            full_pin_path = "{" + "{}/{}".format(node, pin_name) + "}"
+            # 2. Create Unique Names for New Logic
+            # Clean up the node name to make it a valid TCL variable
             clean_name = node.replace("\\", "").replace("[", "_").replace("]", "_")
             xor_inst_name = "TPI_XOR_{}".format(clean_name)
             new_net_name  = "n_tpi_{}".format(clean_name)
 
-            # --- ECO COMMANDS ---
+            # 3. WRITE THE ECO SURGERY COMMANDS
+            # Step A: Identify the existing net connected to the pin
+            # We use 'get_nets -of_objects' to find what wire is currently there.
+            f.write("set target_net [get_nets -of_objects [get_pins {}/{}]]\n".format(node, pin_name))
             
-            # 1. Capture existing net
-            f.write("set target_net [get_nets -of_objects [get_pins {}]]\n".format(full_pin_path))
+            # Step B: Create the new XOR Cell (Floating)
+            f.write("create_cell {} XOR2X1_LVT\n".format(xor_inst_name))
             
-            # 2. Create the XOR Cell (Using Braces {} and the Reference Variable)
-            # Syntax: create_cell {INSTANCE_NAME} $LIB_CELL_REF
-            f.write("create_cell {{{}}} $lib_cell_ref\n".format(xor_inst_name))
+            # Step C: Disconnect the existing net from the driver pin
+            # This leaves the driver pin empty and the net floating (connected to loads)
+            f.write("disconnect_net $target_net {}/{}\n".format(node, pin_name))
             
-            # 3. Disconnect original wire
-            f.write("disconnect_net $target_net {}\n".format(full_pin_path))
-            
-            # 4. Connect original wire to XOR Output
+            # Step D: Connect the existing net (Loads) to the XOR Output (Y)
             f.write("connect_net $target_net {}/Y\n".format(xor_inst_name))
             
-            # 5. Bridge Driver -> XOR Input
+            # Step E: Create a new tiny net to connect Driver -> XOR Input (A1)
             f.write("create_net {}\n".format(new_net_name))
-            f.write("connect_net {} {}\n".format(new_net_name, full_pin_path))
+            f.write("connect_net {} {}/{}\n".format(new_net_name, node, pin_name))
             f.write("connect_net {} {}/A1\n".format(new_net_name, xor_inst_name))
             
-            # 6. Connect Control
+            # Step F: Connect Control Signal to XOR Input (A2)
             f.write("connect_net TEST_ENABLE {}/A2\n".format(xor_inst_name))
             f.write("\n")
             
-    print "[*] Done. Generated Robust ECO commands."
+    print "[*] Done. Generated robust ECO commands."
 
 # ==========================================
 # MAIN
@@ -185,5 +185,3 @@ if __name__ == "__main__":
         generate_tcl_script(top_nodes, circuit)
     else:
         print "Error: No victims found."
-
-
