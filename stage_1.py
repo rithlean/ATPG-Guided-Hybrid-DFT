@@ -111,50 +111,57 @@ def generate_tcl_script(selected_nodes, circuit):
     print "[*] Generating TCL Script: {}...".format(OUTPUT_TCL)
     with open(OUTPUT_TCL, 'w') as f:
         f.write("# Stage 1: Inversion TPI Insertion (ECO Surgery Mode)\n")
-        f.write("# This script manually splices XOR gates into the netlist.\n")
+        f.write("# Robust Syntax: Uses braces and dynamic lib_cell lookup\n\n")
+        
+        # 1. SETUP: Find the exact library cell name once
+        f.write("# Find the XOR cell in the loaded library to avoid ambiguity\n")
+        f.write("set lib_cell_ref [get_object_name [get_lib_cells */XOR2X1_LVT]]\n")
+        f.write("if {$lib_cell_ref == \"\"} { echo \"Error: XOR2X1_LVT not found in library!\"; exit }\n")
+        f.write("echo \"Using Library Cell: $lib_cell_ref\"\n\n")
+        
         f.write("create_port -direction in TEST_ENABLE\n\n")
         
         for node, score in selected_nodes:
             f.write("# --------------------------------------------------------\n")
             f.write("# Target Node: {} (Score: {})\n".format(node, score))
             
-            # 1. Determine Pin Name (Q for regs, Y for gates)
+            # Determine Pin Name
             if "reg" in node or "last_" in node or "DFF" in node:
                 pin_name = "Q"
             else:
                 pin_name = "Y"
                 
-            # 2. Create Unique Names for New Logic
-            # Clean up the node name to make it a valid TCL variable
+            # Construct Safe Names
+            full_pin_path = "{" + "{}/{}".format(node, pin_name) + "}"
             clean_name = node.replace("\\", "").replace("[", "_").replace("]", "_")
             xor_inst_name = "TPI_XOR_{}".format(clean_name)
             new_net_name  = "n_tpi_{}".format(clean_name)
 
-            # 3. WRITE THE ECO SURGERY COMMANDS
-            # Step A: Identify the existing net connected to the pin
-            # We use 'get_nets -of_objects' to find what wire is currently there.
-            f.write("set target_net [get_nets -of_objects [get_pins {}/{}]]\n".format(node, pin_name))
+            # --- ECO COMMANDS ---
             
-            # Step B: Create the new XOR Cell (Floating)
-            f.write("create_cell {} XOR2X1_LVT\n".format(xor_inst_name))
+            # 1. Capture existing net
+            f.write("set target_net [get_nets -of_objects [get_pins {}]]\n".format(full_pin_path))
             
-            # Step C: Disconnect the existing net from the driver pin
-            # This leaves the driver pin empty and the net floating (connected to loads)
-            f.write("disconnect_net $target_net {}/{}\n".format(node, pin_name))
+            # 2. Create the XOR Cell (Using Braces {} and the Reference Variable)
+            # Syntax: create_cell {INSTANCE_NAME} $LIB_CELL_REF
+            f.write("create_cell {{{}}} $lib_cell_ref\n".format(xor_inst_name))
             
-            # Step D: Connect the existing net (Loads) to the XOR Output (Y)
+            # 3. Disconnect original wire
+            f.write("disconnect_net $target_net {}\n".format(full_pin_path))
+            
+            # 4. Connect original wire to XOR Output
             f.write("connect_net $target_net {}/Y\n".format(xor_inst_name))
             
-            # Step E: Create a new tiny net to connect Driver -> XOR Input (A1)
+            # 5. Bridge Driver -> XOR Input
             f.write("create_net {}\n".format(new_net_name))
-            f.write("connect_net {} {}/{}\n".format(new_net_name, node, pin_name))
+            f.write("connect_net {} {}\n".format(new_net_name, full_pin_path))
             f.write("connect_net {} {}/A1\n".format(new_net_name, xor_inst_name))
             
-            # Step F: Connect Control Signal to XOR Input (A2)
+            # 6. Connect Control
             f.write("connect_net TEST_ENABLE {}/A2\n".format(xor_inst_name))
             f.write("\n")
             
-    print "[*] Done. Generated robust ECO commands."
+    print "[*] Done. Generated Robust ECO commands."
 
 # ==========================================
 # MAIN
@@ -173,3 +180,4 @@ if __name__ == "__main__":
         generate_tcl_script(top_nodes, circuit)
     else:
         print "Error: No victims found."
+
