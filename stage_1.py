@@ -119,7 +119,12 @@ def generate_tcl_script(selected_nodes, circuit):
         f.write("if {$lib_cell_ref == \"\"} { echo \"Error: XOR2X1_LVT not found in library!\"; exit }\n")
         f.write("echo \"Using Library Cell: $lib_cell_ref\"\n\n")
         
-        f.write("create_port -direction in TEST_ENABLE\n\n")
+        # --- FIX STARTS HERE ---
+        f.write("# Create the Port AND the Internal Net\n")
+        f.write("create_port -direction in TEST_ENABLE\n")
+        f.write("create_net TEST_ENABLE\n")
+        f.write("connect_net TEST_ENABLE TEST_ENABLE\n\n")
+        # --- FIX ENDS HERE ---
         
         for node, score in selected_nodes:
             f.write("# --------------------------------------------------------\n")
@@ -180,4 +185,5 @@ if __name__ == "__main__":
         generate_tcl_script(top_nodes, circuit)
     else:
         print "Error: No victims found."
+
 
