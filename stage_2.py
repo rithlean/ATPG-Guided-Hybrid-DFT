@@ -175,41 +175,61 @@ def select_scan_candidates(circuit, victims):
     return selected
 
 # ==========================================
-# PART 4: VERILOG SCAN INSERTION
+# PART 4: VERILOG REWRITER (Fixed)
 # ==========================================
 def write_scan_verilog(circuit, scan_chain):
     print "[*] Injecting Scan Chain into Verilog..."
     
     content = circuit.raw_content
     
-    # 1. ADD PORTS
-    if "input" in content:
-        # Check if ports already exist (to avoid duplication if re-running)
-        if "scan_in" not in content:
-            new_ports = "\n  input scan_in, scan_enable;\n  output scan_out;\n"
-            content = content.replace("input", new_ports + "input", 1)
+    # -------------------------------------------------------
+    # 1. FIX MODULE HEADER (The "Missing Definition" Error)
+    # -------------------------------------------------------
+    # We must find "module name (" and inject the new ports there.
+    # Regex: Look for 'module' -> spaces -> word -> spaces -> '('
+    module_def_pattern = re.compile(r"(module\s+[\w\\]+\s*\()", re.DOTALL)
     
-    # 2. BUILD THE CHAIN
+    if module_def_pattern.search(content):
+        # Insert ports right at the start of the list
+        content = module_def_pattern.sub(r"\1 scan_in, scan_enable, scan_out, ", content, count=1)
+    else:
+        print "Error: Could not find 'module' definition line."
+        return
+
+    # -------------------------------------------------------
+    # 2. ADD PORT DECLARATIONS (The "Input/Output" Lines)
+    # -------------------------------------------------------
+    # Find the first 'input' or 'output' keyword and insert definitions before it
+    port_decl_pattern = re.compile(r"(input|output)\s", re.DOTALL)
+    
+    if port_decl_pattern.search(content):
+        new_decls = "\n  input scan_in, scan_enable;\n  output scan_out;\n  "
+        content = port_decl_pattern.sub(new_decls + r"\1 ", content, count=1)
+    
+    # -------------------------------------------------------
+    # 3. BUILD THE CHAIN (Insert MUXes)
+    # -------------------------------------------------------
     current_scan_input = "scan_in"
-    
+    final_q_net = ""
+
     for i, reg_name in enumerate(scan_chain):
-        is_last = (i == len(scan_chain) - 1)
-        
         reg_type = circuit.inst_type[reg_name]
         pins = circuit.inst_pins[reg_name]
         
-        # Identify Pins (Adapt for your library naming D/Q/QN)
+        # Identify Pins (Check your library naming!)
         original_d_net = pins.get('D') or pins.get('d')
         q_net = pins.get('Q') or pins.get('q') or pins.get('QN') or pins.get('qn')
         
         if not original_d_net or not q_net:
             print "WARNING: Could not find D/Q pins for {}. Skipping.".format(reg_name)
             continue
+            
+        final_q_net = q_net # Keep track of the last Q for the output
 
         mux_inst_name = "MUX_SCAN_{}".format(i)
         mux_out_net   = "n_scan_mux_{}".format(i)
         
-        # Create MUX: .A(Func), .B(Scan), .S(Enable) -> Y
+        # Create MUX String
         mux_verilog = "  wire {};\n".format(mux_out_net)
         mux_verilog += "  {} {} ( .{} ({}), .{} ({}), .{} (scan_enable), .{} ({}) );\n".format(
             MUX_CELL_NAME, mux_inst_name,
@@ -219,33 +239,43 @@ def write_scan_verilog(circuit, scan_chain):
             MUX_PINS['Y'], mux_out_net         
         )
         
-        # Regex Replace the Register Connection
+        # Regex to safely replace the specific instance's .D connection
+        # Matches: (Type Name ( ... ) .D ( OLD_NET ) ... );
         reg_pattern = r"({}\s+{}\s*\([\s\S]*?)\.D\s*\(\s*{}\s*\)([\s\S]*?\);)".format(
             re.escape(reg_type), re.escape(reg_name), re.escape(original_d_net)
         )
         
-        # Verify match before replacing
         if not re.search(reg_pattern, content):
-            print "    ! Error matching regex for {}".format(reg_name)
+            print "    ! Error finding instance text for {}".format(reg_name)
             continue
 
+        # Inject MUX output into Register Input
         replacement = r"\1.D( {} )\2".format(mux_out_net)
         content = re.sub(reg_pattern, replacement, content, count=1)
         
-        # Insert MUX definition before the register
+        # Insert MUX definition immediately before the register instance
+        # We search for the instance again (it's unique) and prepend logic
         idx = content.find(reg_type + " " + reg_name)
         if idx != -1:
             content = content[:idx] + mux_verilog + content[idx:]
         
         current_scan_input = q_net
-        
-        if is_last:
-            content += "\n  assign scan_out = {};\n".format(q_net)
 
+    # -------------------------------------------------------
+    # 4. ASSIGN SCAN OUT (The "Parsing Error" Fix)
+    # -------------------------------------------------------
+    # We must insert the assign BEFORE 'endmodule'
+    if final_q_net:
+        assign_cmd = "\n  assign scan_out = {};\n".format(final_q_net)
+        # Replace 'endmodule' with 'assign ... endmodule'
+        content = content.replace("endmodule", assign_cmd + "endmodule")
+    
+    # -------------------------------------------------------
+    # 5. WRITE FILE
+    # -------------------------------------------------------
     with open(OUTPUT_VERILOG, 'w') as f:
         f.write(content)
     print "[*] Success! Scan Chain inserted. Output: {}".format(OUTPUT_VERILOG)
-
 # ==========================================
 # MAIN
 # ==========================================
