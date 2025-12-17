@@ -5,19 +5,24 @@ from collections import defaultdict
 # ==========================================
 # CONFIGURATION
 # ==========================================
-NETLIST_FILE    = "b10_tpi.v"      # Input Netlist (Result of Stage 1)
-REPORT_FILE     = "stage2_failures.rpt" # Fault report from Stage 1 run
-OUTPUT_VERILOG  = "b10_scan.v"     # Output Netlist
+NETLIST_FILE    = "b10_tpi.v"            # Input: The TPI-inserted netlist from Stage 1
+REPORT_FILE     = "stage2_failures.rpt"  # Input: The fault report after running Stage 1
+OUTPUT_VERILOG  = "b10_scan.v"           # Output: Final Scan-Inserted Netlist
 
 # SCAN CONFIGURATION
-MUX_CELL_NAME   = "MUX2X1_LVT"     # Name of your Library MUX
+MUX_CELL_NAME   = "MUX2X1_LVT"           # Check your library for the exact MUX name!
 MUX_PINS        = {"A": "A", "B": "B", "S": "S", "Y": "Y"} 
 # Mapping: A=Normal Data, B=Scan Data, S=Scan Enable, Y=Output
 
-MAX_SCAN_LENGTH = 5                # How many FFs to scan (Budget)
+MAX_SCAN_LENGTH = 5                      # Budget: How many registers to scan
+
+# INTELLIGENT SELECTION FILTERS
+# We ignore these registers because we already fixed them with XOR TPIs (Stage 1).
+# This forces the tool to select Data Path registers (High Observability points).
+IGNORE_PATTERNS = ["stato_reg", "TPI_XOR"] 
 
 # ==========================================
-# PART 1: NETLIST PARSER (Enhanced for Registers)
+# PART 1: NETLIST PARSER
 # ==========================================
 class CircuitGraph:
     def __init__(self):
@@ -25,12 +30,13 @@ class CircuitGraph:
         self.instance_to_output = {}
         self.net_driver_inst = {}
         self.inst_type = {} 
-        self.inst_pins = defaultdict(dict) # Stores pin connections: {inst: {pin: net}}
+        self.inst_pins = defaultdict(dict)
+        self.raw_content = ""
 
     def parse_verilog(self, filename):
         print "[*] Parsing Netlist: {}...".format(filename)
         with open(filename, 'r') as f:
-            self.raw_content = f.read() # Keep raw text for rewriting later
+            self.raw_content = f.read()
 
         # Regex to find instances and capture their pin lists
         instance_pattern = re.compile(r'([\w\\]+)\s+([\w\\\[\]]+)\s*\((.*?)\);', re.DOTALL)
@@ -40,36 +46,42 @@ class CircuitGraph:
             clean_inst = inst_name.strip()
             self.inst_type[clean_inst] = cell_type
             
-            # Parse Pins: .Pin(Net)
+            # Parse Pins
             pin_pattern = re.compile(r'\.([\w\[\]]+)\s*\(\s*([\w\\\[\]]+)\s*\)')
             pin_matches = pin_pattern.findall(pins)
             
-            inputs = []
-            output = None
-            
             for pin_name, net_name in pin_matches:
-                self.inst_pins[clean_inst][pin_name] = net_name # Store pin map
+                self.inst_pins[clean_inst][pin_name] = net_name 
                 
                 # Identify Outputs (Q/QN for Regs, Y/Z for Gates)
                 if pin_name in ['Y', 'Z', 'Q', 'QN']: 
-                    output = net_name
                     self.instance_to_output[clean_inst] = net_name
                     self.net_driver_inst[net_name] = clean_inst
-                # Identify Inputs
-                elif pin_name not in ['CLK', 'RSTB', 'VDD', 'VSS']:
-                    inputs.append(net_name)
+                    # Initialize list for this net
+                    if net_name not in self.drivers: self.drivers[net_name] = []
+                
+                # Identify Inputs (Anything not Output or Power)
+                elif pin_name not in ['CLK', 'RSTB', 'VDD', 'VSS', 'CK', 'RN']:
+                    # We need to map NET -> DRIVER, so we store inputs relative to output
+                    # But for simple tracing, we just need to know inputs of this instance
+                    pass
             
-            if output:
-                self.drivers[output] = inputs
+            # Map Inputs to Output for tracing
+            output_net = self.instance_to_output.get(clean_inst)
+            if output_net:
+                for pin_name, net_name in pin_matches:
+                    if pin_name not in ['Y', 'Z', 'Q', 'QN', 'CLK', 'RSTB', 'VDD', 'VSS']:
+                        self.drivers[output_net].append(net_name)
 
         print "    - Parsed {} instances.".format(len(matches))
 
-    # BFS Cone Trace (Same as Stage 1)
     def get_full_fanin_cone(self, start_inst):
+        """ Traces backwards to find which logic drives the fault. """
         cone_map = {} 
         start_net = self.instance_to_output.get(start_inst)
         if not start_net: return {}
         
+        # Initial drivers
         driver_nets = self.drivers.get(start_net, [])
         bfs_queue = [] 
         
@@ -85,7 +97,7 @@ class CircuitGraph:
             
             cone_map[curr_inst] = dist
             
-            # Boundary check: Stop at Registers
+            # Boundary check: Stop at Registers (Don't trace through them)
             ctype = self.inst_type.get(curr_inst, "")
             if "reg" in curr_inst or "DFF" in ctype: 
                 continue
@@ -100,7 +112,7 @@ class CircuitGraph:
         return cone_map
 
 # ==========================================
-# PART 2: FAILURE PARSER (Unchanged)
+# PART 2: FAILURE PARSER
 # ==========================================
 def parse_tetramax_failures(filename):
     print "[*] Parsing Failure Report: {}...".format(filename)
@@ -108,6 +120,7 @@ def parse_tetramax_failures(filename):
     try:
         with open(filename, 'r') as f:
             for line in f:
+                # We specifically look for NO (Not Observed) and ND (Not Detected)
                 if "ND" in line or "NO" in line:
                     parts = line.split()
                     if len(parts) > 0:
@@ -115,127 +128,120 @@ def parse_tetramax_failures(filename):
                         inst = path.split('/')[0]
                         victims.append(inst)
     except IOError:
+        print "Error: Could not read report file."
         return []
     return list(set(victims))
 
 # ==========================================
-# PART 3: REGISTER SELECTION
+# PART 3: SMART SELECTION
 # ==========================================
 def select_scan_candidates(circuit, victims):
-    print "[*] Analyzing Registers for Partial Scan..."
+    print "[*] Analyzing Logic for Partial Scan..."
+    print "    - Ignoring Control Logic: {}".format(IGNORE_PATTERNS)
     
-    # We only care about Registers that appear in the cone of failures
     reg_scores = defaultdict(float)
     
     for victim in victims:
-        # 1. If victim IS a register, prioritize it heavily
+        # 1. If the victim IS a register, it's an Observability Point.
+        # This is the "Sink" logic. If last_r_reg is NO, we must scan it.
         if "reg" in victim or "DFF" in circuit.inst_type.get(victim, ""):
-            reg_scores[victim] += 10.0 # Huge weight for direct failures
+            reg_scores[victim] += 10.0 
         
-        # 2. Trace back to find which registers drive the logic failing downstream
+        # 2. Trace back to see if a register drives this fault
         cone = circuit.get_full_fanin_cone(victim)
         for node, dist in cone.items():
             if "reg" in node or "DFF" in circuit.inst_type.get(node, ""):
-                # Closer registers get higher score
                 weight = 5.0 / (1.0 + dist)
                 reg_scores[node] += weight
 
     # Sort registers by score
     sorted_regs = sorted(reg_scores.items(), key=lambda x: x[1], reverse=True)
     
-    # Pick top N
     selected = []
     print "    ---------------------------------------"
     print "    Rank | Register Name      | Score"
     print "    ---------------------------------------"
+    
     for i, (reg, score) in enumerate(sorted_regs):
-        if i >= MAX_SCAN_LENGTH: break
+        # FILTER: Skip Control Logic or previously fixed logic
+        if any(pat in reg for pat in IGNORE_PATTERNS):
+            continue
+            
+        if len(selected) >= MAX_SCAN_LENGTH: break
+        
         print "    {:4} | {:18} | {:.2f}".format(i+1, reg, score)
         selected.append(reg)
         
     return selected
 
 # ==========================================
-# PART 4: VERILOG REWRITER (The Hard Part)
+# PART 4: VERILOG SCAN INSERTION
 # ==========================================
 def write_scan_verilog(circuit, scan_chain):
     print "[*] Injecting Scan Chain into Verilog..."
     
     content = circuit.raw_content
     
-    # 1. ADD PORTS (Naive insertion after last input/output)
-    # Find the last semicolon before the first 'assign' or 'instance'
-    # A simple hack: look for the module definition end ");" or just add inputs
+    # 1. ADD PORTS
     if "input" in content:
-        # Add scan ports after the first input found
-        new_ports = "\n  input scan_in, scan_enable;\n  output scan_out;\n"
-        content = content.replace("input", new_ports + "input", 1)
+        # Check if ports already exist (to avoid duplication if re-running)
+        if "scan_in" not in content:
+            new_ports = "\n  input scan_in, scan_enable;\n  output scan_out;\n"
+            content = content.replace("input", new_ports + "input", 1)
     
     # 2. BUILD THE CHAIN
-    # Chain: scan_in -> [MUX -> REG1] -> Q1 -> [MUX -> REG2] -> Q2 ... -> scan_out
-    
     current_scan_input = "scan_in"
     
     for i, reg_name in enumerate(scan_chain):
         is_last = (i == len(scan_chain) - 1)
         
-        # Get details
         reg_type = circuit.inst_type[reg_name]
         pins = circuit.inst_pins[reg_name]
         
-        original_d_net = pins.get('D') # Assumes D pin is named 'D'
-        q_net = pins.get('Q')          # Assumes Q pin is named 'Q'
+        # Identify Pins (Adapt for your library naming D/Q/QN)
+        original_d_net = pins.get('D') or pins.get('d')
+        q_net = pins.get('Q') or pins.get('q') or pins.get('QN') or pins.get('qn')
         
         if not original_d_net or not q_net:
             print "WARNING: Could not find D/Q pins for {}. Skipping.".format(reg_name)
             continue
 
-        # Create Names
         mux_inst_name = "MUX_SCAN_{}".format(i)
         mux_out_net   = "n_scan_mux_{}".format(i)
         
-        # 3. CREATE MUX INSTANCE STRING
-        # MUX Logic: If S=0 (Func), Y=A. If S=1 (Scan), Y=B.
-        # .A(func), .B(scan), .S(se)
+        # Create MUX: .A(Func), .B(Scan), .S(Enable) -> Y
         mux_verilog = "  wire {};\n".format(mux_out_net)
         mux_verilog += "  {} {} ( .{} ({}), .{} ({}), .{} (scan_enable), .{} ({}) );\n".format(
             MUX_CELL_NAME, mux_inst_name,
-            MUX_PINS['A'], original_d_net,     # Normal Path
-            MUX_PINS['B'], current_scan_input, # Scan Path
-            MUX_PINS['S'],                     # Scan Enable
-            MUX_PINS['Y'], mux_out_net         # Result
+            MUX_PINS['A'], original_d_net,     
+            MUX_PINS['B'], current_scan_input, 
+            MUX_PINS['S'],                     
+            MUX_PINS['Y'], mux_out_net         
         )
         
-        # 4. MODIFY REGISTER INSTANCE IN TEXT
-        # We need to find the specific text ".D( old_net )" for THIS instance and replace it.
-        # Strategy: Find the instance definition, then replace the D connection inside it.
-        
-        # Regex to match the specific instance: "DFF ... reg_name ... ( ... );"
-        # We use re.escape to handle brackets in names like reg[0]
+        # Regex Replace the Register Connection
         reg_pattern = r"({}\s+{}\s*\([\s\S]*?)\.D\s*\(\s*{}\s*\)([\s\S]*?\);)".format(
             re.escape(reg_type), re.escape(reg_name), re.escape(original_d_net)
         )
         
-        # Replacement: Keep start and end, swap the D net
+        # Verify match before replacing
+        if not re.search(reg_pattern, content):
+            print "    ! Error matching regex for {}".format(reg_name)
+            continue
+
         replacement = r"\1.D( {} )\2".format(mux_out_net)
-        
-        # Perform Substitution
         content = re.sub(reg_pattern, replacement, content, count=1)
         
-        # Insert the MUX definition BEFORE the register
-        # We find the register again (now modified) and prepend the MUX
+        # Insert MUX definition before the register
         idx = content.find(reg_type + " " + reg_name)
         if idx != -1:
             content = content[:idx] + mux_verilog + content[idx:]
         
-        # Update scan input for next loop
         current_scan_input = q_net
         
-        # If last, connect output port
         if is_last:
             content += "\n  assign scan_out = {};\n".format(q_net)
 
-    # 5. WRITE FILE
     with open(OUTPUT_VERILOG, 'w') as f:
         f.write(content)
     print "[*] Success! Scan Chain inserted. Output: {}".format(OUTPUT_VERILOG)
@@ -252,5 +258,7 @@ if __name__ == "__main__":
         scan_chain = select_scan_candidates(circuit, victims)
         if scan_chain:
             write_scan_verilog(circuit, scan_chain)
+        else:
+            print "No suitable registers found after filtering."
     else:
-        print "Error: No victims found to guide scan insertion."
+        print "Error: No victims found."
