@@ -1,232 +1,199 @@
 import re
 import sys
-from collections import defaultdict
+import math
 
-# ==========================================
+# ==============================================================================
 # CONFIGURATION
-# ==========================================
-NETLIST_FILE    = "b10_tpi.v"            
-REPORT_FILE     = "stage2_failures.rpt"  
-OUTPUT_VERILOG  = "b10_scan.v"           
+# ==============================================================================
+# 1. Input Files
+NETLIST_FILE    = "b10_tpi.v"            # Your current netlist
+REPORT_FILE     = "stage2_failures.rpt"  # The report from TetraMAX (run report_faults -level 100 > file)
 
-# ---------------------------------------------------------
-# LIBRARY CONFIGURATION (MATCHING YOUR MUX21X1_LVT)
-# ---------------------------------------------------------
-MUX_CELL_NAME   = "MUX21X1_LVT"     # Your specific cell name
-# Pin Mapping: 
-# 'A': Functional Data (A1) -> Selected when Scan_Enable = 0
-# 'B': Scan Data       (A2) -> Selected when Scan_Enable = 1
-# 'S': Scan Enable     (S0)
-# 'Y': Output          (Y)
+# 2. Output File
+OUTPUT_VERILOG  = "b10_compressed.v"
+
+# 3. Strategy Settings
+FAULTS_PER_REG  = 4   # Compression Ratio (4 Faults -> 1 Register)
+
+# 4. Standard Cell Library Definitions (SAED32)
+# MUX to be inserted
+MUX_CELL_NAME   = "MUX21X1_LVT"
+# MUX Pin Mapping: 
+# A1 = Normal Data (0)
+# A2 = Test Data (1)
+# S0 = Select
+# Y  = Output
 MUX_PINS        = {"A": "A1", "B": "A2", "S": "S0", "Y": "Y"} 
 
-MAX_SCAN_LENGTH = 5                      
-IGNORE_PATTERNS = ["stato_reg", "TPI_XOR"] 
+# ==============================================================================
+# LOGIC IMPLEMENTATION
+# ==============================================================================
 
-# ==========================================
-# PART 1: NETLIST PARSER
-# ==========================================
-class CircuitGraph:
-    def __init__(self):
-        self.drivers = defaultdict(list)
-        self.instance_to_output = {}
-        self.net_driver_inst = {}
-        self.inst_type = {} 
-        self.inst_pins = defaultdict(dict)
-        self.raw_content = ""
-
-    def parse_verilog(self, filename):
-        print "[*] Parsing Netlist: {}...".format(filename)
-        with open(filename, 'r') as f:
-            self.raw_content = f.read()
-
-        instance_pattern = re.compile(r'([\w\\]+)\s+([\w\\\[\]]+)\s*\((.*?)\);', re.DOTALL)
-        matches = instance_pattern.findall(self.raw_content)
+def get_available_registers(content):
+    """ 
+    Scans netlist for Flip-Flops to use as observation points.
+    Looks for standard instances with .D() connections.
+    """
+    registers = []
+    # Regex to capture: Type, Name, and current D-pin connection
+    # Pattern looks for: CellType InstanceName ( ... .D( net ) ... );
+    # We allow flexible spacing and newlines.
+    pattern = re.compile(r'([\w\\]+)\s+([\w\\]+)\s*\((?:[^;]*?)\.([Dd])\s*\(\s*([\w\\\[\]]+)\s*\)(?:[^;]*?)\);', re.DOTALL)
+    
+    matches = pattern.findall(content)
+    for m in matches:
+        reg_type, reg_name, d_pin, d_net = m
         
-        for cell_type, inst_name, pins in matches:
-            clean_inst = inst_name.strip()
-            self.inst_type[clean_inst] = cell_type
+        # FILTER: Only pick likely Flip-Flops (DFF, FD, or names containing 'reg')
+        # This prevents picking buffers or gates by accident.
+        if "DFF" in reg_type or "reg" in reg_name or "FD" in reg_type:
+            registers.append({
+                "type": reg_type, 
+                "name": reg_name, 
+                "d_pin": d_pin, 
+                "d_net": d_net
+            })
             
-            pin_pattern = re.compile(r'\.([\w\[\]]+)\s*\(\s*([\w\\\[\]]+)\s*\)')
-            pin_matches = pin_pattern.findall(pins)
-            
-            for pin_name, net_name in pin_matches:
-                self.inst_pins[clean_inst][pin_name] = net_name 
-                if pin_name in ['Y', 'Z', 'Q', 'QN']: 
-                    self.instance_to_output[clean_inst] = net_name
-                    self.net_driver_inst[net_name] = clean_inst
-                    if net_name not in self.drivers: self.drivers[net_name] = []
-                elif pin_name not in ['CLK', 'RSTB', 'VDD', 'VSS', 'CK', 'RN']:
-                    pass
-            
-            output_net = self.instance_to_output.get(clean_inst)
-            if output_net:
-                for pin_name, net_name in pin_matches:
-                    if pin_name not in ['Y', 'Z', 'Q', 'QN', 'CLK', 'RSTB', 'VDD', 'VSS']:
-                        self.drivers[output_net].append(net_name)
+    return registers
 
-        print "    - Parsed {} instances.".format(len(matches))
-
-    def get_full_fanin_cone(self, start_inst):
-        cone_map = {} 
-        start_net = self.instance_to_output.get(start_inst)
-        if not start_net: return {}
-        
-        driver_nets = self.drivers.get(start_net, [])
-        bfs_queue = [] 
-        for net in driver_nets:
-             d_inst = self.net_driver_inst.get(net)
-             if d_inst: bfs_queue.append( (d_inst, 1) )
-        
-        visited_insts = set()
-        while bfs_queue:
-            curr_inst, dist = bfs_queue.pop(0)
-            if curr_inst in visited_insts: continue
-            visited_insts.add(curr_inst)
-            cone_map[curr_inst] = dist
-            
-            ctype = self.inst_type.get(curr_inst, "")
-            if "reg" in curr_inst or "DFF" in ctype: 
-                continue
-                
-            curr_net = self.instance_to_output.get(curr_inst)
-            if curr_net:
-                upstream_nets = self.drivers.get(curr_net, [])
-                for u_net in upstream_nets:
-                    u_inst = self.net_driver_inst.get(u_net)
-                    if u_inst and u_inst not in visited_insts:
-                        bfs_queue.append( (u_inst, dist + 1) )
-        return cone_map
-
-# ==========================================
-# PART 2: FAILURE PARSER
-# ==========================================
-def parse_tetramax_failures(filename):
-    print "[*] Parsing Failure Report: {}...".format(filename)
-    victims = []
+def get_fault_targets(filename, content):
+    """ 
+    Parses TetraMAX report to find failing NETS.
+    """
+    targets = []
+    seen_nets = set()
+    
     try:
         with open(filename, 'r') as f:
             for line in f:
-                if "ND" in line or "NO" in line:
+                # We specifically want 'NO' (Not Observed) faults
+                if "NO" in line:
                     parts = line.split()
-                    if len(parts) > 0:
-                        path = parts[-1]
-                        inst = path.split('/')[0]
-                        victims.append(inst)
+                    # TetraMAX format usually ends with: ... code   \path/to/instance/pin
+                    full_path = parts[-1] 
+                    inst_name = full_path.split('/')[0]
+                    
+                    # We need the OUTPUT NET of this failing instance.
+                    # We search the netlist for the instance and capture its output pin (.Y, .Q, .Z)
+                    # Regex looks for: InstanceName ( ... .Y( target_net ) ... )
+                    safe_inst = re.escape(inst_name)
+                    net_search = re.search(r"{}\s*\([\s\S]*?\.(Y|Z|Q|QN)\s*\(\s*([\w\\\[\]]+)\s*\)".format(safe_inst), content)
+                    
+                    if net_search:
+                        net = net_search.group(2)
+                        # Avoid duplicates (observing the same net twice wastes resources)
+                        if net not in seen_nets:
+                            targets.append(net)
+                            seen_nets.add(net)
+                            
     except IOError:
+        print("Error: Could not read report file: " + filename)
         return []
-    return list(set(victims))
-
-# ==========================================
-# PART 3: SMART SELECTION
-# ==========================================
-def select_scan_candidates(circuit, victims):
-    print "[*] Analyzing Logic for Partial Scan..."
-    reg_scores = defaultdict(float)
-    
-    for victim in victims:
-        if "reg" in victim or "DFF" in circuit.inst_type.get(victim, ""):
-            reg_scores[victim] += 10.0 
-        cone = circuit.get_full_fanin_cone(victim)
-        for node, dist in cone.items():
-            if "reg" in node or "DFF" in circuit.inst_type.get(node, ""):
-                weight = 5.0 / (1.0 + dist)
-                reg_scores[node] += weight
-
-    sorted_regs = sorted(reg_scores.items(), key=lambda x: x[1], reverse=True)
-    selected = []
-    print "    ---------------------------------------"
-    print "    Rank | Register Name      | Score"
-    print "    ---------------------------------------"
-    
-    for i, (reg, score) in enumerate(sorted_regs):
-        if any(pat in reg for pat in IGNORE_PATTERNS): continue
-        if len(selected) >= MAX_SCAN_LENGTH: break
-        print "    {:4} | {:18} | {:.2f}".format(i+1, reg, score)
-        selected.append(reg)
-    return selected
-
-# ==========================================
-# PART 4: VERILOG REWRITER (Corrected Pins)
-# ==========================================
-def write_scan_verilog(circuit, scan_chain):
-    print "[*] Injecting Scan Chain into Verilog..."
-    content = circuit.raw_content
-    
-    # 1. FIX MODULE HEADER (Inject ports)
-    module_def_pattern = re.compile(r"(module\s+[\w\\]+\s*\()", re.DOTALL)
-    if module_def_pattern.search(content):
-        content = module_def_pattern.sub(r"\1 scan_in, scan_enable, scan_out, ", content, count=1)
-    
-    # 2. ADD PORT DECLARATIONS
-    port_decl_pattern = re.compile(r"(input|output)\s", re.DOTALL)
-    if port_decl_pattern.search(content):
-        new_decls = "\n  input scan_in, scan_enable;\n  output scan_out;\n  "
-        content = port_decl_pattern.sub(new_decls + r"\1 ", content, count=1)
-    
-    # 3. BUILD THE CHAIN
-    current_scan_input = "scan_in"
-    final_q_net = ""
-
-    for i, reg_name in enumerate(scan_chain):
-        reg_type = circuit.inst_type[reg_name]
-        pins = circuit.inst_pins[reg_name]
         
-        # Identify Pins (Case insensitive safety check)
-        original_d_net = pins.get('D') or pins.get('d')
-        q_net = pins.get('Q') or pins.get('q') or pins.get('QN') or pins.get('qn')
-        
-        if not original_d_net or not q_net:
-            print "WARNING: Could not find D/Q pins for {}. Skipping.".format(reg_name)
-            continue
+    return targets
+
+def inject_compressed_observation():
+    print("--------------------------------------------------")
+    print("  DFT AUTOMATION: XOR COMPRESSION & INSERTION")
+    print("--------------------------------------------------")
+    
+    # 1. Read Netlist
+    with open(NETLIST_FILE, 'r') as f:
+        content = f.read()
+
+    # 2. Analyze Resources
+    registers = get_available_registers(content)
+    targets   = get_fault_targets(REPORT_FILE, content)
+
+    print("  [*] Netlist Analysis:")
+    print("      - Available Registers: {}".format(len(registers)))
+    print("      - Unobserved Faults:   {}".format(len(targets)))
+    
+    if not targets:
+        print("  [!] No faults found. Is the report file correct?")
+        return
+
+    # 3. Add Global Test Mode Pin
+    # We verify if 'test_mode' already exists to avoid errors
+    if "input test_mode" not in content:
+        print("  [*] Adding global 'test_mode' input pin...")
+        # Inject into module arguments: module top ( a, b, ... ) -> module top ( test_mode, a, b ... )
+        content = re.sub(r"(module\s+[\w\\]+\s*\()", r"\1 test_mode, ", content, count=1)
+        # Inject into definitions: input a; -> input test_mode; input a;
+        content = re.sub(r"(input\s)", r"input test_mode;\n  \1", content, count=1)
+
+    # 4. Begin Insertion Loop
+    print("  [*] Beginning Insertion (Ratio {}:1)...".format(FAULTS_PER_REG))
+    
+    fault_idx = 0
+    modified_count = 0
+    
+    for i, host in enumerate(registers):
+        # Stop if we have covered all faults
+        if fault_idx >= len(targets): 
+            break
             
-        final_q_net = q_net 
-
-        mux_inst_name = "MUX_SCAN_{}".format(i)
-        mux_out_net   = "n_scan_mux_{}".format(i)
+        # grab the next chunk of faults
+        chunk = targets[fault_idx : fault_idx + FAULTS_PER_REG]
+        fault_idx += len(chunk)
         
-        # --- FIXED MUX SYNTAX HERE ---
-        # Note: We now use the mapped names (A1, A2, S0) from CONFIGURATION
+        # Prepare Variable Names
+        xor_net_name = "n_obs_xor_{}".format(i)
+        mux_name     = "MUX_OBS_{}".format(i)
+        mux_out_net  = "n_mux_out_{}".format(i)
+
+        # A. GENERATE LOGIC (XOR or Wire)
+        logic_verilog = ""
+        if len(chunk) == 1:
+            # Single Fault: Direct connection (Buffer)
+            logic_verilog = "  wire {} = {}; // Direct Observation\n".format(xor_net_name, chunk[0])
+        else:
+            # Multiple Faults: XOR Tree
+            # Verilog: wire x = a ^ b ^ c;
+            logic_verilog = "  wire {} = {}; // Compressed {} faults\n".format(xor_net_name, " ^ ".join(chunk), len(chunk))
+
+        # B. GENERATE MUX
+        # Mux Logic: Sel=0 -> Host.D (Normal), Sel=1 -> XOR_Net (Test)
         mux_verilog = "  wire {};\n".format(mux_out_net)
-        mux_verilog += "  {} {} ( .{} ({}), .{} ({}), .{} (scan_enable), .{} ({}) );\n".format(
-            MUX_CELL_NAME, mux_inst_name,
-            MUX_PINS['A'], original_d_net,     # A -> A1 (Func)
-            MUX_PINS['B'], current_scan_input, # B -> A2 (Scan)
-            MUX_PINS['S'],                     # S -> S0 (Enable)
-            MUX_PINS['Y'], mux_out_net         # Y -> Y
+        mux_verilog += "  {} {} ( .{} ({}), .{} ({}), .{} (test_mode), .{} ({}) );\n".format(
+            MUX_CELL_NAME, mux_name,
+            MUX_PINS['A'], host['d_net'],     # Original Normal Data
+            MUX_PINS['B'], xor_net_name,      # Compressed Fault Data
+            MUX_PINS['S'],                    # Control
+            MUX_PINS['Y'], mux_out_net        # Output to Register
+        )
+
+        # C. MODIFY NETLIST
+        # Find the specific text of the register instance to replace
+        reg_pattern = r"({}\s+{}\s*\([\s\S]*?)\.{}\s*\(\s*{}\s*\)([\s\S]*?\);)".format(
+            re.escape(host['type']), re.escape(host['name']), 
+            re.escape(host['d_pin']), re.escape(host['d_net'])
         )
         
-        reg_pattern = r"({}\s+{}\s*\([\s\S]*?)\.D\s*\(\s*{}\s*\)([\s\S]*?\);)".format(
-            re.escape(reg_type), re.escape(reg_name), re.escape(original_d_net)
-        )
-        
-        if not re.search(reg_pattern, content):
-            print "    ! Error finding instance text for {}".format(reg_name)
-            continue
+        if re.search(reg_pattern, content):
+            # 1. Update the Register's D-pin to listen to the MUX output
+            content = re.sub(reg_pattern, r"\1.{}( {} )\3".format(host['d_pin'], mux_out_net), content, count=1)
+            
+            # 2. Insert the new Logic (XOR + MUX) immediately BEFORE the register
+            # We find the start index of the register and insert our string there
+            idx = content.find(host['type'] + " " + host['name'])
+            content = content[:idx] + logic_verilog + mux_verilog + content[idx:]
+            
+            modified_count += 1
+            print("      - Fixed: Reg '{}' now observing nets: {}".format(host['name'], chunk))
+        else:
+            print("      [!] Error: Could not locate register instance {}".format(host['name']))
 
-        replacement = r"\1.D( {} )\2".format(mux_out_net)
-        content = re.sub(reg_pattern, replacement, content, count=1)
-        
-        idx = content.find(reg_type + " " + reg_name)
-        if idx != -1:
-            content = content[:idx] + mux_verilog + content[idx:]
-        
-        current_scan_input = q_net
-
-    # 4. ASSIGN SCAN OUT
-    if final_q_net:
-        assign_cmd = "\n  assign scan_out = {};\n".format(final_q_net)
-        content = content.replace("endmodule", assign_cmd + "endmodule")
-    
+    # 5. Write Output
     with open(OUTPUT_VERILOG, 'w') as f:
         f.write(content)
-    print "[*] Success! Scan Chain inserted. Output: {}".format(OUTPUT_VERILOG)
+        
+    print("--------------------------------------------------")
+    print("  SUCCESS!")
+    print("  - Modified {} registers.".format(modified_count))
+    print("  - Total Observed Faults: {}".format(fault_idx))
+    print("  - Output File: {}".format(OUTPUT_VERILOG))
+    print("--------------------------------------------------")
 
 if __name__ == "__main__":
-    circuit = CircuitGraph()
-    circuit.parse_verilog(NETLIST_FILE)
-    victims = parse_tetramax_failures(REPORT_FILE)
-    if victims:
-        scan_chain = select_scan_candidates(circuit, victims)
-        if scan_chain:
-            write_scan_verilog(circuit, scan_chain)
+    inject_compressed_observation()
