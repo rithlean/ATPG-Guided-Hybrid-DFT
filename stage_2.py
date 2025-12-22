@@ -1,199 +1,184 @@
 import re
 import sys
-import math
 
-# ==============================================================================
+# ==========================================
 # CONFIGURATION
-# ==============================================================================
-# 1. Input Files
-NETLIST_FILE    = "b10_tpi.v"            # Your current netlist
-REPORT_FILE     = "stage2_failures.rpt"  # The report from TetraMAX (run report_faults -level 100 > file)
+# ==========================================
+NETLIST_FILE     = "b10.v"
+FAULT_REPORT     = "failures.rpt"  # The list of undetected faults (from Tetramax)
+OUTPUT_TCL       = "insert_atomic_fix.tcl"
 
-# 2. Output File
-OUTPUT_VERILOG  = "b10_compressed.v"
+# Keywords to identify side-inputs (Control Signals)
+SIDE_INPUT_KEYWORDS = ["reset", "rst", "clear", "clr", "enable", "en", "valid", "test", "scan"]
 
-# 3. Strategy Settings
-FAULTS_PER_REG  = 4   # Compression Ratio (4 Faults -> 1 Register)
+# ==========================================
+# PART 1: PARSERS
+# ==========================================
+class CircuitAnalyzer:
+    def __init__(self):
+        self.gates = {}     # Map: {output_net: {name, type, inputs, pins}}
+        self.victims = set() # Set of nets that have faults
 
-# 4. Standard Cell Library Definitions (SAED32)
-# MUX to be inserted
-MUX_CELL_NAME   = "MUX21X1_LVT"
-# MUX Pin Mapping: 
-# A1 = Normal Data (0)
-# A2 = Test Data (1)
-# S0 = Select
-# Y  = Output
-MUX_PINS        = {"A": "A1", "B": "A2", "S": "S0", "Y": "Y"} 
-
-# ==============================================================================
-# LOGIC IMPLEMENTATION
-# ==============================================================================
-
-def get_available_registers(content):
-    """ 
-    Scans netlist for Flip-Flops to use as observation points.
-    Looks for standard instances with .D() connections.
-    """
-    registers = []
-    # Regex to capture: Type, Name, and current D-pin connection
-    # Pattern looks for: CellType InstanceName ( ... .D( net ) ... );
-    # We allow flexible spacing and newlines.
-    pattern = re.compile(r'([\w\\]+)\s+([\w\\]+)\s*\((?:[^;]*?)\.([Dd])\s*\(\s*([\w\\\[\]]+)\s*\)(?:[^;]*?)\);', re.DOTALL)
-    
-    matches = pattern.findall(content)
-    for m in matches:
-        reg_type, reg_name, d_pin, d_net = m
-        
-        # FILTER: Only pick likely Flip-Flops (DFF, FD, or names containing 'reg')
-        # This prevents picking buffers or gates by accident.
-        if "DFF" in reg_type or "reg" in reg_name or "FD" in reg_type:
-            registers.append({
-                "type": reg_type, 
-                "name": reg_name, 
-                "d_pin": d_pin, 
-                "d_net": d_net
-            })
-            
-    return registers
-
-def get_fault_targets(filename, content):
-    """ 
-    Parses TetraMAX report to find failing NETS.
-    """
-    targets = []
-    seen_nets = set()
-    
-    try:
+    def parse_verilog(self, filename):
+        print "[*] Parsing Netlist: {}...".format(filename)
         with open(filename, 'r') as f:
-            for line in f:
-                # We specifically want 'NO' (Not Observed) faults
-                if "NO" in line:
+            content = f.read()
+
+        # Regex to capture instances: Type Name ( .Pin(Net) ... )
+        instance_pattern = re.compile(r'([a-zA-Z0-9_]+)\s+([a-zA-Z0-9_]+)\s*\((.*?)\);', re.DOTALL)
+        
+        count = 0
+        for cell_type, inst_name, pin_block in instance_pattern.findall(content):
+            # Parse Pins
+            pin_pattern = re.compile(r'\.([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_\[\]]+)\s*\)')
+            pin_matches = pin_pattern.findall(pin_block)
+            
+            inputs = []
+            output_net = None
+            pins_map = {}
+
+            for port, net in pin_matches:
+                pins_map[port] = net
+                if port in ['Y', 'Z', 'Q', 'QN', 'SO']: # Standard Output Pin Names
+                    output_net = net
+                else:
+                    inputs.append(net)
+
+            if output_net:
+                self.gates[output_net] = {
+                    'name': inst_name,
+                    'type': cell_type,
+                    'inputs': inputs,
+                    'pins': pins_map
+                }
+                count += 1
+        print "    - Indexed {} gates by output net.".format(count)
+
+    def parse_failures(self, filename):
+        print "[*] Parsing Fault List: {}...".format(filename)
+        try:
+            with open(filename, 'r') as f:
+                for line in f:
+                    # Look for lines like: "stuck_at_0   U_AND_15/A" or just the net name
                     parts = line.split()
-                    # TetraMAX format usually ends with: ... code   \path/to/instance/pin
-                    full_path = parts[-1] 
-                    inst_name = full_path.split('/')[0]
-                    
-                    # We need the OUTPUT NET of this failing instance.
-                    # We search the netlist for the instance and capture its output pin (.Y, .Q, .Z)
-                    # Regex looks for: InstanceName ( ... .Y( target_net ) ... )
-                    safe_inst = re.escape(inst_name)
-                    net_search = re.search(r"{}\s*\([\s\S]*?\.(Y|Z|Q|QN)\s*\(\s*([\w\\\[\]]+)\s*\)".format(safe_inst), content)
-                    
-                    if net_search:
-                        net = net_search.group(2)
-                        # Avoid duplicates (observing the same net twice wastes resources)
-                        if net not in seen_nets:
-                            targets.append(net)
-                            seen_nets.add(net)
+                    if len(parts) > 0:
+                        path = parts[-1] # Usually the last item is the pin/net
+                        
+                        # Clean up: Extract the Net Name or Instance Name
+                        # If report gives "U15/Y", we want to know the net driven by U15
+                        if "/" in path:
+                            inst_name = path.split('/')[0]
+                            # Find the net driven by this instance (Reverse lookup)
+                            # (For simplicity in this script, we assume strict net names or verify manually)
+                            # Better approach: Just store the instance name as a 'suspect'
+                            self.victims.add(inst_name)
+                        else:
+                            self.victims.add(path)
                             
-    except IOError:
-        print("Error: Could not read report file: " + filename)
-        return []
+            print "    - Found {} fault locations.".format(len(self.victims))
+        except IOError:
+            print "Error: Could not read fault report."
+
+# ==========================================
+# PART 2: THE "TRAP HUNTER" ALGORITHM
+# ==========================================
+def find_and_fix_traps(analyzer):
+    print "[*] correlating Faults with Blocking Gates..."
+    fixes = []
+    
+    # Iterate through all gates to see if they are "Traps" for our Victims
+    for out_net, gate in analyzer.gates.items():
         
-    return targets
+        # CHECK 1: Is this gate consuming a 'Victim' signal?
+        # We look at the inputs of this gate.
+        victim_input = None
+        for inp in gate['inputs']:
+            # Check if this input comes from a known faulty instance/net
+            # (Simplified matching: if input net name contains victim name)
+            for v in analyzer.victims:
+                if v in inp: 
+                    victim_input = inp
+                    break
+        
+        if not victim_input: continue # This gate isn't carrying a fault we care about.
 
-def inject_compressed_observation():
-    print("--------------------------------------------------")
-    print("  DFT AUTOMATION: XOR COMPRESSION & INSERTION")
-    print("--------------------------------------------------")
-    
-    # 1. Read Netlist
-    with open(NETLIST_FILE, 'r') as f:
-        content = f.read()
-
-    # 2. Analyze Resources
-    registers = get_available_registers(content)
-    targets   = get_fault_targets(REPORT_FILE, content)
-
-    print("  [*] Netlist Analysis:")
-    print("      - Available Registers: {}".format(len(registers)))
-    print("      - Unobserved Faults:   {}".format(len(targets)))
-    
-    if not targets:
-        print("  [!] No faults found. Is the report file correct?")
-        return
-
-    # 3. Add Global Test Mode Pin
-    # We verify if 'test_mode' already exists to avoid errors
-    if "input test_mode" not in content:
-        print("  [*] Adding global 'test_mode' input pin...")
-        # Inject into module arguments: module top ( a, b, ... ) -> module top ( test_mode, a, b ... )
-        content = re.sub(r"(module\s+[\w\\]+\s*\()", r"\1 test_mode, ", content, count=1)
-        # Inject into definitions: input a; -> input test_mode; input a;
-        content = re.sub(r"(input\s)", r"input test_mode;\n  \1", content, count=1)
-
-    # 4. Begin Insertion Loop
-    print("  [*] Beginning Insertion (Ratio {}:1)...".format(FAULTS_PER_REG))
-    
-    fault_idx = 0
-    modified_count = 0
-    
-    for i, host in enumerate(registers):
-        # Stop if we have covered all faults
-        if fault_idx >= len(targets): 
-            break
+        # CHECK 2: Is it a Blocking Gate (AND/OR)?
+        g_type = gate['type'].upper()
+        forcing_action = None
+        
+        if "AND" in g_type or "NAND" in g_type:
+            forcing_action = "FORCE_1"
+        elif "OR" in g_type or "NOR" in g_type:
+            forcing_action = "FORCE_0"
             
-        # grab the next chunk of faults
-        chunk = targets[fault_idx : fault_idx + FAULTS_PER_REG]
-        fault_idx += len(chunk)
-        
-        # Prepare Variable Names
-        xor_net_name = "n_obs_xor_{}".format(i)
-        mux_name     = "MUX_OBS_{}".format(i)
-        mux_out_net  = "n_mux_out_{}".format(i)
+        if not forcing_action: continue # Pass-through logic (buffers, XORS) don't block.
 
-        # A. GENERATE LOGIC (XOR or Wire)
-        logic_verilog = ""
-        if len(chunk) == 1:
-            # Single Fault: Direct connection (Buffer)
-            logic_verilog = "  wire {} = {}; // Direct Observation\n".format(xor_net_name, chunk[0])
-        else:
-            # Multiple Faults: XOR Tree
-            # Verilog: wire x = a ^ b ^ c;
-            logic_verilog = "  wire {} = {}; // Compressed {} faults\n".format(xor_net_name, " ^ ".join(chunk), len(chunk))
-
-        # B. GENERATE MUX
-        # Mux Logic: Sel=0 -> Host.D (Normal), Sel=1 -> XOR_Net (Test)
-        mux_verilog = "  wire {};\n".format(mux_out_net)
-        mux_verilog += "  {} {} ( .{} ({}), .{} ({}), .{} (test_mode), .{} ({}) );\n".format(
-            MUX_CELL_NAME, mux_name,
-            MUX_PINS['A'], host['d_net'],     # Original Normal Data
-            MUX_PINS['B'], xor_net_name,      # Compressed Fault Data
-            MUX_PINS['S'],                    # Control
-            MUX_PINS['Y'], mux_out_net        # Output to Register
-        )
-
-        # C. MODIFY NETLIST
-        # Find the specific text of the register instance to replace
-        reg_pattern = r"({}\s+{}\s*\([\s\S]*?)\.{}\s*\(\s*{}\s*\)([\s\S]*?\);)".format(
-            re.escape(host['type']), re.escape(host['name']), 
-            re.escape(host['d_pin']), re.escape(host['d_net'])
-        )
-        
-        if re.search(reg_pattern, content):
-            # 1. Update the Register's D-pin to listen to the MUX output
-            content = re.sub(reg_pattern, r"\1.{}( {} )\3".format(host['d_pin'], mux_out_net), content, count=1)
+        # CHECK 3: Does it have a "Side Input" that looks like a Control Signal?
+        side_input = None
+        for inp in gate['inputs']:
+            if inp == victim_input: continue # Skip the fault itself
             
-            # 2. Insert the new Logic (XOR + MUX) immediately BEFORE the register
-            # We find the start index of the register and insert our string there
-            idx = content.find(host['type'] + " " + host['name'])
-            content = content[:idx] + logic_verilog + mux_verilog + content[idx:]
-            
-            modified_count += 1
-            print("      - Fixed: Reg '{}' now observing nets: {}".format(host['name'], chunk))
-        else:
-            print("      [!] Error: Could not locate register instance {}".format(host['name']))
-
-    # 5. Write Output
-    with open(OUTPUT_VERILOG, 'w') as f:
-        f.write(content)
+            # Heuristic: Is this a Reset/Enable line?
+            if any(k in inp.lower() for k in SIDE_INPUT_KEYWORDS):
+                side_input = inp
+                break
         
-    print("--------------------------------------------------")
-    print("  SUCCESS!")
-    print("  - Modified {} registers.".format(modified_count))
-    print("  - Total Observed Faults: {}".format(fault_idx))
-    print("  - Output File: {}".format(OUTPUT_VERILOG))
-    print("--------------------------------------------------")
+        if side_input:
+            print "    -> MATCH: Fault on '{}' blocked by Gate '{}' via Control '{}'".format(
+                victim_input, gate['name'], side_input
+            )
+            
+            fixes.append({
+                'gate': gate['name'],
+                'side_net': side_input,
+                'action': forcing_action,
+                'victim': victim_input
+            })
 
+    return fixes
+
+# ==========================================
+# PART 3: GENERATE TCL
+# ==========================================
+def generate_tcl(fixes, filename):
+    print "[*] Generating Atomic Fix TCL: {}...".format(filename)
+    with open(filename, 'w') as f:
+        f.write("# Phase 2: Fault-Aware Atomic Sensitization\n")
+        f.write("set LIB_OR  [get_lib_cells */OR2X1]\n")
+        f.write("set LIB_AND [get_lib_cells */AND2X1]\n")
+        f.write("create_port -direction in TEST_MODE\n\n")
+
+        count = 0
+        for fix in fixes:
+            count += 1
+            inst_name = "U_ATOMIC_FIX_{}".format(count)
+            safe_net  = "n_safe_{}_{}".format(count, fix['side_net'])
+            
+            f.write("# Fix #{}: Unblocking fault on {}\n".format(count, fix['victim']))
+            
+            if fix['action'] == "FORCE_1":
+                # INSERT OR GATE
+                f.write("create_cell {} $LIB_OR\n".format(inst_name))
+                f.write("create_net {}\n".format(safe_net))
+                f.write("disconnect_net {} [get_pins {}/A]\n".format(fix['side_net'], fix['gate'])) # Assume pin A is side input (Logic needs refinement here for pin mapping)
+                 # Note: In real TCL, we filter pins by net name like in the previous script
+                f.write("connect_net {} [get_pins {}/A]\n".format(safe_net, fix['gate']))
+                
+                f.write("connect_net {} {}/A\n".format(fix['side_net'], inst_name))
+                f.write("connect_net TEST_MODE {}/B\n".format(inst_name))
+                f.write("connect_net {} {}/Y\n\n".format(safe_net, inst_name))
+
+# ==========================================
+# MAIN
+# ==========================================
 if __name__ == "__main__":
-    inject_compressed_observation()
+    analyzer = CircuitAnalyzer()
+    analyzer.parse_verilog(NETLIST_FILE)
+    analyzer.parse_failures(FAULT_REPORT)
+    
+    fixes = find_and_fix_traps(analyzer)
+    
+    if fixes:
+        generate_tcl(fixes, OUTPUT_TCL)
+    else:
+        print "No blocked faults found matching criteria."
