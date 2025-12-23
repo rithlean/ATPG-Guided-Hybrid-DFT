@@ -7,6 +7,7 @@ import sys
 NETLIST_FILE     = "test_scan_b10_tpi.v"
 FAULT_REPORT     = "stage2_failures.rpt"
 OUTPUT_TCL       = "insert_atomic_fix.tcl"
+TEST_PORT_NAME   = "TEST_ENABLE"  # Reusing your existing port
 
 # ==========================================
 # PART 1: PARSERS
@@ -21,11 +22,9 @@ class CircuitAnalyzer:
         with open(filename, 'r') as f:
             content = f.read()
 
-        # Regex: Type Name ( .Pin(Net) ... )
         instance_pattern = re.compile(r'([a-zA-Z0-9_]+)\s+([\\a-zA-Z0-9_\[\]]+)\s*\((.*?)\);', re.DOTALL)
         
         for cell_type, inst_name, pin_block in instance_pattern.findall(content):
-            # Parse Pins
             pin_pattern = re.compile(r'\.([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_\[\]\\]+)\s*\)')
             pin_matches = pin_pattern.findall(pin_block)
             
@@ -33,7 +32,6 @@ class CircuitAnalyzer:
             for port, net in pin_matches:
                 pins_map[port] = net
             
-            # Clean up instance name (remove leading backslash if present for dict key)
             clean_name = inst_name.strip()
             self.gates[clean_name] = {
                 'type': cell_type,
@@ -49,11 +47,9 @@ class CircuitAnalyzer:
                     parts = line.split()
                     if len(parts) >= 3:
                         ftype = parts[0]
-                        location = parts[2] # e.g., "U140/A1"
-                        
+                        location = parts[2]
                         if "/" in location:
                             inst, pin = location.split('/')
-                            # Handle escaped names in report if they differ
                             self.faults.append({'inst': inst, 'pin': pin, 'type': ftype})
         except IOError:
             print "Error: Could not read fault report."
@@ -70,7 +66,6 @@ def find_traps(analyzer):
         victim_pin = f['pin']
         
         if inst not in analyzer.gates: 
-            # Try adding backslash if missing
             if ("\\" + inst) in analyzer.gates:
                 inst = "\\" + inst
             else:
@@ -79,33 +74,28 @@ def find_traps(analyzer):
         gate = analyzer.gates[inst]
         g_type = gate['type'].upper()
         
-        # 1. Logic Type Check
+        # Determine Logic
         forcing_action = None
         if "AND" in g_type or "NAND" in g_type:
-            forcing_action = "FORCE_1"
-        elif "OR" in g_type or "NOR" in g_type:
-            forcing_action = "FORCE_0"
+            forcing_action = "FORCE_1" # Need 1 to unblock
+        elif "OR" in g_type or "NOR" in g_type or "XOR" in g_type:
+            forcing_action = "FORCE_0" # Need 0 to unblock
             
         if not forcing_action: continue
 
-        # 2. Find Side Inputs (The Blockers)
         side_nets = []
         side_pins = []
         
         for pin_name, net_name in gate['pins'].items():
-            # Skip the victim pin and output pins
             if pin_name != victim_pin and pin_name not in ['Y', 'Z', 'Q', 'QN']:
                 side_nets.append(net_name)
                 side_pins.append(pin_name)
 
         if not side_nets: continue
         
-        # Take the first blocker found (Simplification for Atomic Fix)
         blocker_net = side_nets[0]
-        blocker_pin = side_pins[0] # Crucial: We need to know WHICH pin to disconnect
+        blocker_pin = side_pins[0]
 
-        # 3. Create Fix Entry
-        # Avoid duplicate fixes on the same gate/pin
         duplicate = False
         for fix in fixes:
             if fix['gate'] == inst and fix['gate_pin'] == blocker_pin:
@@ -113,12 +103,11 @@ def find_traps(analyzer):
                 break
         
         if not duplicate:
-            # Shorten message for cleaner printing
-            print "    -> MATCH: {}/{} blocked by '{}'".format(inst, victim_pin, blocker_net)
+            # print "    -> MATCH: {}/{} blocked by '{}'".format(inst, victim_pin, blocker_net)
             fixes.append({
                 'gate': inst,
-                'gate_pin': blocker_pin, # e.g., "A2"
-                'side_net': blocker_net, # e.g., "n218"
+                'gate_pin': blocker_pin,
+                'side_net': blocker_net,
                 'action': forcing_action,
                 'victim': f['inst'] + "/" + f['pin']
             })
@@ -126,56 +115,71 @@ def find_traps(analyzer):
     return fixes
 
 # ==========================================
-# PART 3: GENERATE TCL (Customized for LVT)
+# PART 3: GENERATE TCL (INTEGRATED)
 # ==========================================
 def generate_tcl(fixes, filename):
     print "[*] Generating Atomic Fix TCL: {}...".format(filename)
+    
+    # Check if we need the inverter (Do we have any FORCE_0 cases?)
+    need_inverter = any(f['action'] == "FORCE_0" for f in fixes)
+    
     with open(filename, 'w') as f:
-        f.write("# Phase 2: Fault-Aware Atomic Sensitization (Custom LVT)\n")
+        f.write("# Phase 2: Atomic Fix using Existing TEST_ENABLE\n")
         
-        # UPDATED LIBRARY SEARCH FOR LVT CELLS
-        f.write("set LIB_OR  [get_lib_cells */OR2*] ;# Generic match to find OR2X1_LVT\n")
+        f.write("set LIB_OR  [get_lib_cells */OR2*]\n")
         f.write("set LIB_AND [get_lib_cells */AND2*]\n")
-        f.write("if {[sizeof_collection $LIB_OR] == 0} { echo \"WARNING: No OR2 cell found!\" }\n")
-        f.write("create_port -direction in TEST_MODE\n\n")
+        f.write("set LIB_INV [get_lib_cells */INV*]\n") # Need Inverter for polarity
+        
+        # Note: We do NOT create_port because TEST_ENABLE already exists.
+        
+        # 1. Create Helper Inverter if needed (for Force 0 logic)
+        if need_inverter:
+            f.write("\n# --- Helper: Invert TEST_ENABLE for Force 0 Logic ---\n")
+            f.write("create_cell U_TE_INV [index_collection $LIB_INV 0]\n")
+            f.write("create_net n_TEST_ENABLE_bar\n")
+            f.write("connect_net {} U_TE_INV/A\n".format(TEST_PORT_NAME))
+            f.write("connect_net n_TEST_ENABLE_bar U_TE_INV/Y\n")
+            f.write("# ----------------------------------------------------\n\n")
 
         count = 0
         for fix in fixes:
             count += 1
             gate_name = fix['gate']
-            pin_name  = fix['gate_pin'] # e.g., "A1" or "A2"
+            pin_name  = fix['gate_pin']
             side_net  = fix['side_net']
             
             inst_name = "U_ATOMIC_FIX_{}".format(count)
             safe_net  = "n_safe_{}_{}".format(count, side_net.replace("\\","").replace("[","_").replace("]",""))
             
-            f.write("# Fix #{}: Unblocking {} (Blocked by {} at pin {})\n".format(count, fix['victim'], side_net, pin_name))
+            f.write("# Fix #{}: Unblocking {} ({})\n".format(count, fix['victim'], fix['action']))
             
             if fix['action'] == "FORCE_1":
-                # INSERT OR GATE
+                # INSERT OR GATE (Passes 1 when TEST_ENABLE is 1)
                 f.write("create_cell {} [index_collection $LIB_OR 0]\n".format(inst_name))
                 f.write("create_net {}\n".format(safe_net))
                 
-                # Disconnect the specific pin (A1 or A2)
                 f.write("disconnect_net {} {}/{}\n".format(side_net, gate_name, pin_name))
                 f.write("connect_net {} {}/{}\n".format(safe_net, gate_name, pin_name))
                 
-                # Connect Fix Logic (Side_Net OR TEST_MODE)
                 f.write("connect_net {} {}/A1\n".format(side_net, inst_name))
-                f.write("connect_net TEST_MODE {}/A2\n".format(inst_name))
+                f.write("connect_net {} {}/A2\n".format(TEST_PORT_NAME, inst_name)) 
                 f.write("connect_net {} {}/Y\n\n".format(safe_net, inst_name))
 
             elif fix['action'] == "FORCE_0":
-                # INSERT AND GATE
+                # INSERT AND GATE (Passes 0 when n_TEST_ENABLE_bar is 0... Wait!)
+                # Logic Check: We want Output=0 when Test=1.
+                # AND Gate: A1=Side, A2=Control.
+                # If Control=0 -> Output=0. 
+                # So we connect A2 to n_TEST_ENABLE_bar (which is 0 when Test=1).
+                
                 f.write("create_cell {} [index_collection $LIB_AND 0]\n".format(inst_name))
                 f.write("create_net {}\n".format(safe_net))
                 
                 f.write("disconnect_net {} {}/{}\n".format(side_net, gate_name, pin_name))
                 f.write("connect_net {} {}/{}\n".format(safe_net, gate_name, pin_name))
                 
-                # Connect Fix Logic
                 f.write("connect_net {} {}/A1\n".format(side_net, inst_name))
-                f.write("connect_net TEST_MODE {}/A2\n".format(inst_name)) 
+                f.write("connect_net n_TEST_ENABLE_bar {}/A2\n".format(inst_name)) 
                 f.write("connect_net {} {}/Y\n\n".format(safe_net, inst_name))
 
 if __name__ == "__main__":
