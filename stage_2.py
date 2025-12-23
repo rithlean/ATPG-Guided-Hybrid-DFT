@@ -117,4 +117,71 @@ def find_traps(analyzer):
             print "    -> MATCH: {}/{} blocked by '{}'".format(inst, victim_pin, blocker_net)
             fixes.append({
                 'gate': inst,
-                'gate_pin': blocker_pin, # e.g., "A2
+                'gate_pin': blocker_pin, # e.g., "A2"
+                'side_net': blocker_net, # e.g., "n218"
+                'action': forcing_action,
+                'victim': f['inst'] + "/" + f['pin']
+            })
+
+    return fixes
+
+# ==========================================
+# PART 3: GENERATE TCL (Customized for LVT)
+# ==========================================
+def generate_tcl(fixes, filename):
+    print "[*] Generating Atomic Fix TCL: {}...".format(filename)
+    with open(filename, 'w') as f:
+        f.write("# Phase 2: Fault-Aware Atomic Sensitization (Custom LVT)\n")
+        
+        # UPDATED LIBRARY SEARCH FOR LVT CELLS
+        f.write("set LIB_OR  [get_lib_cells */OR2*] ;# Generic match to find OR2X1_LVT\n")
+        f.write("set LIB_AND [get_lib_cells */AND2*]\n")
+        f.write("if {[sizeof_collection $LIB_OR] == 0} { echo \"WARNING: No OR2 cell found!\" }\n")
+        f.write("create_port -direction in TEST_MODE\n\n")
+
+        count = 0
+        for fix in fixes:
+            count += 1
+            gate_name = fix['gate']
+            pin_name  = fix['gate_pin'] # e.g., "A1" or "A2"
+            side_net  = fix['side_net']
+            
+            inst_name = "U_ATOMIC_FIX_{}".format(count)
+            safe_net  = "n_safe_{}_{}".format(count, side_net.replace("\\","").replace("[","_").replace("]",""))
+            
+            f.write("# Fix #{}: Unblocking {} (Blocked by {} at pin {})\n".format(count, fix['victim'], side_net, pin_name))
+            
+            if fix['action'] == "FORCE_1":
+                # INSERT OR GATE
+                f.write("create_cell {} [index_collection $LIB_OR 0]\n".format(inst_name))
+                f.write("create_net {}\n".format(safe_net))
+                
+                # Disconnect the specific pin (A1 or A2)
+                f.write("disconnect_net {} {}/{}\n".format(side_net, gate_name, pin_name))
+                f.write("connect_net {} {}/{}\n".format(safe_net, gate_name, pin_name))
+                
+                # Connect Fix Logic (Side_Net OR TEST_MODE)
+                f.write("connect_net {} {}/A1\n".format(side_net, inst_name))
+                f.write("connect_net TEST_MODE {}/A2\n".format(inst_name))
+                f.write("connect_net {} {}/Y\n\n".format(safe_net, inst_name))
+
+            elif fix['action'] == "FORCE_0":
+                # INSERT AND GATE
+                f.write("create_cell {} [index_collection $LIB_AND 0]\n".format(inst_name))
+                f.write("create_net {}\n".format(safe_net))
+                
+                f.write("disconnect_net {} {}/{}\n".format(side_net, gate_name, pin_name))
+                f.write("connect_net {} {}/{}\n".format(safe_net, gate_name, pin_name))
+                
+                # Connect Fix Logic
+                f.write("connect_net {} {}/A1\n".format(side_net, inst_name))
+                f.write("connect_net TEST_MODE {}/A2\n".format(inst_name)) 
+                f.write("connect_net {} {}/Y\n\n".format(safe_net, inst_name))
+
+if __name__ == "__main__":
+    analyzer = CircuitAnalyzer()
+    analyzer.parse_verilog(NETLIST_FILE)
+    analyzer.parse_failures(FAULT_REPORT)
+    fixes = find_traps(analyzer)
+    if fixes: generate_tcl(fixes, OUTPUT_TCL)
+    else: print "No atomic candidates found."
